@@ -1,0 +1,10 @@
+python-binance==1.0.19
+pandas==2.2.0
+numpy==1.26.0
+ta==0.11.0
+yfinance>=1.0.0
+aiohttp==3.9.0
+websockets>=13.0
+python-telegram-bot==21.0
+python-dotenv==1.0.0
+requests==2.31.0

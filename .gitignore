@@ -1,0 +1,18 @@
+.env
+.env.local
+.env.*.local
+*.env
+
+# Datenbank & State
+data/
+logs/
+*.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# SSH Keys
+*.pem
+*.key

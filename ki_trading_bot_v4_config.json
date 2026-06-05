@@ -1,0 +1,588 @@
+{
+  "meta": {
+    "schema_version": "4.0.0",
+    "created_utc": "2026-06-04T00:00:00Z",
+    "description": "KI Trading Bot – vollständige Konfiguration inkl. Infrastruktur, State-Management, WebSocket und Betriebsprozesse",
+    "markets": ["BTCUSDT", "ETHUSDT"],
+    "exchange": "binance_futures",
+    "strategy": "swing_trading",
+    "hold_duration_hours": {"min": 4, "max": 48},
+    "changelog": "v4.0: +startup_init, +state_management, +websocket, +position_monitor, +infrastructure, +order_execution_detail, +reality_corrections"
+  },
+
+  "risk": {
+    "leverage": 3,
+    "leverage_dynamic": false,
+    "margin_type": "ISOLATED",
+    "position_mode": "ONE_WAY",
+    "risk_per_trade_pct": 0.01,
+    "max_open_positions": 1,
+    "position_hard_cap_pct": 0.20,
+    "max_daily_loss_pct": 0.03,
+    "max_trades_per_day": 3,
+    "daily_loss_reset_utc": "00:00",
+    "weekly_stop_consecutive_negative_weeks": 3,
+    "week_start": "monday",
+    "week_start_time_utc": "00:00",
+    "funding_rate_block_threshold": 0.0005,
+    "atr_extreme_volatility_multiplier": 3.0,
+    "atr_elevated_volatility_multiplier": 1.5,
+    "atr_elevated_position_scale": 0.5,
+    "liquidation_buffer_min_pct": 0.10
+  },
+
+  "startup_init": {
+    "description": "Pflicht-Sequenz bei jedem Bot-Start – muss vollständig erfolgreich sein bevor erster Trade möglich",
+    "abort_on_failure": true,
+    "steps": [
+      {
+        "id": "load_state",
+        "action": "load_persisted_state",
+        "source": "bot_state.json",
+        "fallback": "create_empty_state",
+        "on_empty_state": "reconcile_with_exchange"
+      },
+      {
+        "id": "reconcile_positions",
+        "action": "GET /fapi/v2/positionRisk",
+        "purpose": "Offene Positionen vom Exchange laden und mit lokalem State abgleichen",
+        "on_mismatch": "exchange_state_wins",
+        "restore_missing_sl_tp": true
+      },
+      {
+        "id": "sync_account_balance",
+        "action": "GET /fapi/v2/account",
+        "field": "availableBalance",
+        "purpose": "Kontostand für korrekte Positionsgrößen-Berechnung synchronisieren"
+      },
+      {
+        "id": "set_margin_type",
+        "action": "POST /fapi/v1/marginType",
+        "params": {"marginType": "ISOLATED"},
+        "per_symbol": true,
+        "idempotent": true,
+        "ignore_error_code": -4046
+      },
+      {
+        "id": "set_leverage",
+        "action": "POST /fapi/v1/leverage",
+        "params": {"leverage": 3},
+        "per_symbol": true,
+        "idempotent": true
+      },
+      {
+        "id": "load_symbol_filters",
+        "action": "GET /fapi/v1/exchangeInfo",
+        "extract": ["LOT_SIZE.stepSize", "LOT_SIZE.minQty", "PRICE_FILTER.tickSize", "MIN_NOTIONAL.notional"],
+        "cache_ttl_hours": 24,
+        "purpose": "Lot-Größen und Preis-Präzision für Order-Rundung laden"
+      },
+      {
+        "id": "check_open_orders",
+        "action": "GET /fapi/v1/openOrders",
+        "purpose": "Verwaiste Orders aus vorherigem Lauf erkennen und canceln oder adoptieren"
+      },
+      {
+        "id": "start_websockets",
+        "action": "init_websocket_connections",
+        "connections": ["market_stream", "user_data_stream"],
+        "required_before_trading": true
+      },
+      {
+        "id": "telegram_startup_alert",
+        "action": "send_telegram",
+        "message": "Bot gestartet. State: {state_summary}. Offene Pos: {open_positions}. Balance: {balance} USDT"
+      }
+    ]
+  },
+
+  "state_management": {
+    "description": "Persistenter State – nach jedem relevanten Event auf Disk schreiben",
+    "storage_file": "bot_state.json",
+    "backup_file": "bot_state.backup.json",
+    "write_on_events": [
+      "order_placed", "order_filled", "order_cancelled", "sl_set", "tp_set",
+      "position_closed", "daily_loss_update", "weekly_pnl_update", "regime_change", "macro_update"
+    ],
+    "schema": {
+      "open_position": {
+        "symbol": "string|null",
+        "side": "LONG|SHORT|null",
+        "entry_price": "float|null",
+        "qty": "float|null",
+        "sl_price": "float|null",
+        "tp_price": "float|null",
+        "sl_order_id": "string|null",
+        "tp_order_id": "string|null",
+        "entry_order_id": "string|null",
+        "entry_time_utc": "iso8601|null",
+        "atr_at_entry": "float|null",
+        "regime_at_entry": "string|null",
+        "liquidation_price": "float|null"
+      },
+      "daily": {
+        "date_utc": "date",
+        "trade_count": "int",
+        "realized_pnl_usdt": "float",
+        "loss_pct_of_capital": "float"
+      },
+      "weekly": {
+        "week_start_utc": "date",
+        "realized_pnl_usdt": "float",
+        "is_negative": "bool",
+        "consecutive_negative_weeks": "int"
+      },
+      "last_regime": "trending|transition|ranging|null",
+      "last_macro_direction": "LONG|SHORT|BEIDE|null",
+      "last_macro_update_utc": "iso8601|null",
+      "account_balance_usdt": "float",
+      "balance_last_synced_utc": "iso8601"
+    },
+    "atomic_write": true,
+    "write_backup_before_overwrite": true
+  },
+
+  "websocket": {
+    "description": "Pflicht-Verbindungen – REST-Polling reicht laut Binance bei Volatilität nicht",
+    "market_stream": {
+      "url": "wss://fstream.binance.com/stream",
+      "streams": [
+        "{symbol}@kline_15m",
+        "{symbol}@kline_4h",
+        "{symbol}@markPrice@1s",
+        "{symbol}@depth5@500ms"
+      ],
+      "purpose": "OHLCV-Daten, Mark Price für SL-Monitoring, Order Book für Liquidität"
+    },
+    "user_data_stream": {
+      "url": "wss://fstream.binance.com/ws/{listenKey}",
+      "listen_key_endpoint": "POST /fapi/v1/listenKey",
+      "listen_key_renewal_interval_minutes": 30,
+      "purpose": "Order-Fills, Position-Updates, Balance-Changes – zuverlässiger als REST-Polling",
+      "events": {
+        "ORDER_TRADE_UPDATE": "order_fill_handler",
+        "ACCOUNT_UPDATE": "balance_position_handler",
+        "listenKeyExpired": "reconnect_handler"
+      }
+    },
+    "reconnect": {
+      "strategy": "exponential_backoff",
+      "initial_delay_seconds": 1,
+      "max_delay_seconds": 60,
+      "max_retries": -1,
+      "on_reconnect": ["renew_listen_key", "reconcile_state_with_exchange", "resume_monitoring"]
+    },
+    "health_check_interval_seconds": 30,
+    "ping_interval_seconds": 20
+  },
+
+  "order_execution": {
+    "description": "Vollständige Order-Lifecycle inkl. Binance-spezifischer Parameter",
+
+    "binance_order_params": {
+      "position_side": "BOTH",
+      "self_trade_prevention_mode": "EXPIRE_BOTH",
+      "working_type_sl": "MARK_PRICE",
+      "working_type_tp": "MARK_PRICE",
+      "reduce_only_sl": true,
+      "reduce_only_tp": true
+    },
+
+    "qty_rounding": {
+      "description": "Pflicht – Binance lehnt Orders mit falscher Präzision ab",
+      "formula": "round(raw_qty / step_size) * step_size",
+      "min_qty_check": true,
+      "min_notional_check": true,
+      "on_below_min": "abort_trade_and_log"
+    },
+
+    "entry": {
+      "type": "LIMIT",
+      "time_in_force": "GTC",
+      "price_offset_pct": -0.001,
+      "timeout_candles": 2,
+      "timeout_minutes": 30,
+      "timeout_action": "cancel_order",
+      "post_timeout": "rescore_next_cycle",
+      "market_order_fallback": false
+    },
+
+    "sl_order": {
+      "type": "STOP_MARKET",
+      "working_type": "MARK_PRICE",
+      "close_position": true,
+      "price_protection": true,
+      "set_immediately_after_fill": true,
+      "retry": {
+        "max_attempts": 5,
+        "delay_seconds": [1, 2, 4, 8, 16],
+        "on_all_retries_failed": "emergency_close_market_order",
+        "alert_on_retry": true
+      }
+    },
+
+    "tp_order": {
+      "type": "TAKE_PROFIT_MARKET",
+      "working_type": "MARK_PRICE",
+      "close_position": true,
+      "set_immediately_after_fill": true,
+      "retry": {
+        "max_attempts": 5,
+        "delay_seconds": [1, 2, 4, 8, 16],
+        "on_all_retries_failed": "log_and_alert_manual_intervention"
+      }
+    },
+
+    "fill_confirmation": {
+      "primary": "websocket_user_data_stream",
+      "fallback": "rest_poll_GET_fapi_v1_order",
+      "rest_poll_interval_seconds": 5,
+      "rest_poll_max_attempts": 12,
+      "on_fill": ["update_state", "set_sl", "set_tp", "log_entry"]
+    },
+
+    "cancel_on_shutdown": true,
+    "cancel_open_orders_on_emergency_stop": true
+  },
+
+  "position_monitor": {
+    "description": "Laufende Überwachung offener Positionen – läuft parallel zum Signal-Loop",
+    "check_interval_seconds": 30,
+
+    "liquidation_monitor": {
+      "endpoint": "GET /fapi/v2/positionRisk",
+      "field": "liquidationPrice",
+      "warning_buffer_pct": 0.10,
+      "critical_buffer_pct": 0.05,
+      "on_warning": "telegram_alert",
+      "on_critical": "emergency_close_and_alert",
+      "description": "Funding Fees reduzieren kontinuierlich die Margin – Liquidation-Price nähert sich"
+    },
+
+    "unrealized_pnl_monitor": {
+      "endpoint": "GET /fapi/v2/positionRisk",
+      "field": "unRealizedProfit",
+      "log_interval_minutes": 15
+    },
+
+    "max_hold_duration": {
+      "hours": 48,
+      "action_on_timeout": "close_at_market",
+      "alert_before_hours": 4
+    },
+
+    "funding_cost_tracker": {
+      "charge_times_utc": ["00:00", "08:00", "16:00"],
+      "rate_endpoint": "GET /fapi/v1/fundingRate",
+      "log_per_charge": true,
+      "cumulative_cost_field": "state.open_position.total_funding_paid"
+    },
+
+    "sl_tp_verification": {
+      "interval_minutes": 5,
+      "action": "GET /fapi/v1/openOrders",
+      "verify_sl_exists": true,
+      "verify_tp_exists": true,
+      "on_missing": "re_place_order_with_retry"
+    },
+
+    "mark_price_monitor": {
+      "source": "websocket_markPrice_stream",
+      "update_interval_seconds": 1,
+      "use_for": ["liquidation_distance_calc", "pnl_display", "sl_trigger_estimation"]
+    }
+  },
+
+  "position_sizing": {
+    "formula": "max_loss / (sl_pct * leverage)",
+    "max_loss": "account_balance * risk_per_trade_pct",
+    "sl_pct": "sl_distance / current_price",
+    "sl_distance": "atr_multiplier * atr_14_4h",
+    "tp_distance": "3.0 * sl_distance",
+    "rrr": 3.0,
+    "account_balance_source": "state.account_balance_usdt",
+    "atr_multipliers": {
+      "trending":   1.5,
+      "transition": 1.25,
+      "ranging":    1.0
+    }
+  },
+
+  "layer_1_macro": {
+    "schedule_utc": "08:00",
+    "schedule_frequency": "daily",
+    "signals": {
+      "dxy": {
+        "source": "yfinance",
+        "ticker": "DX-Y.NYB",
+        "ma_period": 50,
+        "bullish_threshold_pct": -0.01,
+        "bearish_threshold_pct": 0.01
+      },
+      "sp500": {
+        "source": "yfinance",
+        "ticker": "^GSPC",
+        "ma_period": 20,
+        "bullish_threshold_pct": 0.02,
+        "bearish_threshold_pct": -0.02
+      },
+      "btc_exchange_flow": {
+        "source": "glassnode",
+        "metric": "exchange_net_position_change",
+        "asset": "BTC",
+        "delay_hours": 24,
+        "bullish_threshold_btc": -3000,
+        "bearish_threshold_btc": 3000
+      }
+    },
+    "stale_data_check": {
+      "max_age_hours": 26,
+      "on_stale": "use_last_known_value_and_alert",
+      "on_unavailable": "set_direction_BEIDE_and_alert"
+    },
+    "direction_rules": {
+      "long_only":  "bullish_count >= 2",
+      "short_only": "bearish_count >= 2",
+      "both":       "else"
+    }
+  },
+
+  "layer_2_regime": {
+    "schedule_frequency_hours": 4,
+    "indicators": {
+      "adx": {"period": 14, "timeframe": "4h", "trending_threshold": 25, "ranging_threshold": 20},
+      "atr": {"period": 14, "timeframe": "4h", "baseline_lookback_periods": 20},
+      "ma200": {"period": 200, "timeframe": "4h"}
+    },
+    "regimes": {
+      "trending":   "adx > 25",
+      "transition": "adx >= 20 AND adx <= 25",
+      "ranging":    "adx < 20"
+    }
+  },
+
+  "layer_3_scoring": {
+    "schedule_frequency_minutes": 15,
+    "entry_threshold_long":  5,
+    "entry_threshold_short": -5,
+    "max_score": 8,
+    "min_score": -8,
+    "note": "Gewichte sind Initialwerte – müssen durch Backtesting validiert und ggf. angepasst werden",
+
+    "pillar_a_onchain": [
+      {"id": "funding_extreme", "source": "binance_futures_api", "endpoint": "/fapi/v1/fundingRate", "score_long": 3, "score_short": -3, "condition_long": "funding_rate < -0.0005", "condition_short": "funding_rate > 0.0005"},
+      {"id": "funding_moderate", "source": "binance_futures_api", "score_long": 1, "score_short": -1, "condition_long": "funding_rate >= -0.0005 AND funding_rate <= -0.0002", "condition_short": "funding_rate >= 0.0002 AND funding_rate <= 0.0005"},
+      {"id": "open_interest_squeeze", "source": "binance_futures_api", "endpoint": "/fapi/v1/openInterest", "score_long": 2, "score_short": -2, "condition_long": "oi_delta < 0 AND price_delta < 0", "condition_short": "oi_delta > 0 AND price_delta < 0"},
+      {"id": "whale_transactions", "source": "coinalyze", "score_long": 1, "score_short": -1, "condition_long": "whale_flow == 'accumulation'", "condition_short": "whale_flow == 'distribution'"}
+    ],
+
+    "pillar_b_technical": [
+      {"id": "ma200_position", "score_long": 2, "score_short": -2, "condition_long": "price > ma200 * 1.03", "condition_short": "price < ma200 * 0.97"},
+      {"id": "rsi_oversold", "timeframe": "4h", "period": 14, "score_long": 2, "condition_long": "rsi < 25 AND regime == 'ranging'"},
+      {"id": "rsi_overbought", "timeframe": "4h", "period": 14, "score_short": -2, "condition_short": "rsi > 75 AND regime == 'ranging'"},
+      {"id": "volume_confirmation", "score_confirm": 1, "score_penalize": -1, "condition_confirm": "volume > volume_ma_20 * 1.5"}
+    ],
+
+    "pillar_c_sentiment": [
+      {"id": "fg_extreme_fear_confirmed", "source": "alternative.me", "score_long": 3, "condition": "fg_index < 15 AND candle[-1].close >= candle[-3].low AND candle[-2].close >= candle[-3].low"},
+      {"id": "fg_extreme_fear_unconfirmed", "source": "alternative.me", "score_long": 1, "condition": "fg_index < 15 AND NOT confirmed"},
+      {"id": "fg_extreme_greed_confirmed", "source": "alternative.me", "score_short": -3, "condition": "fg_index > 85 AND candle[-1].close <= candle[-3].high AND candle[-2].close <= candle[-3].high"},
+      {"id": "fg_extreme_greed_unconfirmed", "source": "alternative.me", "score_short": -1, "condition": "fg_index > 85 AND NOT confirmed"}
+    ]
+  },
+
+  "risk_gate": {
+    "description": "7 sequentielle Checks – alle müssen bestehen",
+    "checks_ordered": [
+      {"id": "daily_loss_limit",    "condition": "state.daily.loss_pct_of_capital >= 0.03", "action": "block", "log": "BLOCKED: Tageslimit -3% erreicht"},
+      {"id": "open_position",       "condition": "state.open_position.symbol IS NOT NULL",  "action": "block", "log": "BLOCKED: Offene Position existiert"},
+      {"id": "extreme_volatility",  "condition": "market.atr_ratio > 3.0",                  "action": "block", "log": "BLOCKED: ATR > 3x Baseline"},
+      {"id": "position_size_cap",   "condition": "calculated_qty < min_qty OR calculated_notional < min_notional", "action": "block", "log": "BLOCKED: Positionsgröße zu klein (unter Binance-Minimum)"},
+      {"id": "macro_direction",     "condition": "macro_direction != 'BEIDE' AND order_side != macro_direction", "action": "block", "log": "BLOCKED: Gegen Makro-Filter"},
+      {"id": "funding_rate_high",   "condition": "abs(market.funding_rate) > 0.0005",        "action": "block", "log": "BLOCKED: Funding Rate zu hoch"},
+      {"id": "weekly_stop",         "condition": "state.weekly.consecutive_negative_weeks >= 3", "action": "block_manual_review", "log": "BLOCKED: 3 negative Wochen – manueller Review"}
+    ]
+  },
+
+  "infrastructure": {
+    "deployment": {
+      "method": "docker",
+      "dockerfile_base": "python:3.11-slim",
+      "restart_policy": "unless-stopped",
+      "secrets_method": "environment_variables",
+      "secrets_never_hardcode": ["BINANCE_API_KEY", "BINANCE_SECRET", "TELEGRAM_BOT_TOKEN"],
+      "volumes": ["./data:/app/data", "./logs:/app/logs"],
+      "resource_limits": {"memory": "512m", "cpu": "1.0"}
+    },
+
+    "watchdog": {
+      "description": "Externer Prozess überwacht ob Bot-Hauptprozess noch lebt",
+      "implementation": "cron_job",
+      "check_interval_minutes": 2,
+      "heartbeat_file": "/app/data/heartbeat.json",
+      "max_heartbeat_age_minutes": 5,
+      "on_dead": ["send_telegram_alert", "optional_emergency_close_all"],
+      "heartbeat_write_interval_seconds": 60
+    },
+
+    "api_rate_limit_budget": {
+      "description": "Kumulatives Request-Weight-Budget – Binance: 2400/min, Ban bei Überschreitung",
+      "binance_limit_per_minute": 2400,
+      "estimated_usage": {
+        "layer3_per_cycle_weight": 4,
+        "layer3_cycles_per_minute": 0.067,
+        "layer2_per_cycle_weight": 6,
+        "layer2_cycles_per_minute": 0.0042,
+        "position_monitor_weight": 2,
+        "position_monitor_per_minute": 2,
+        "websocket_replaces_rest_for": ["order_fills", "position_updates", "mark_price"],
+        "estimated_total_per_minute": 12,
+        "safety_margin_pct": 95
+      },
+      "rate_limit_handler": {
+        "on_429": "exponential_backoff_and_alert",
+        "on_418": "ip_ban_stop_all_requests_and_alert",
+        "check_header": "X-MBX-USED-WEIGHT-1M"
+      }
+    },
+
+    "emergency_stop": {
+      "triggers": [
+        "telegram_command /killswitch",
+        "consecutive_api_errors >= 10",
+        "liquidation_buffer_critical",
+        "watchdog_manual_trigger"
+      ],
+      "actions_ordered": [
+        "cancel_all_open_orders",
+        "close_all_positions_market",
+        "save_final_state",
+        "send_telegram_alert",
+        "exit_process"
+      ]
+    },
+
+    "vps": {
+      "provider": "hetzner_or_digitalocean",
+      "location": "eu_frankfurt",
+      "specs": {"ram_gb": 2, "cpu_cores": 1, "disk_gb": 20},
+      "cost_eur_month": {"min": 4, "max": 8},
+      "uptime_target_pct": 99.9
+    }
+  },
+
+  "backtesting": {
+    "required_before_live": true,
+    "min_data_years": 2,
+    "min_simulated_trades": 500,
+    "slippage_pct_range": [0.001, 0.003],
+    "api_latency_simulation_ms": 150,
+    "maker_taker_fee_pct": [0.0002, 0.0004],
+    "funding_rate_per_8h": 0.0001,
+    "required_tests": [
+      "atr_sl_trending_regime",
+      "atr_sl_ranging_regime",
+      "walk_forward_validation",
+      "monte_carlo_trade_order",
+      "regime_transition_handling",
+      "funding_cost_drag_over_48h",
+      "scoring_weight_sensitivity"
+    ],
+    "success_criteria": {
+      "sharpe_ratio_min": 1.0,
+      "max_drawdown_pct_max": 0.20,
+      "min_trades": 500,
+      "win_rate_min": 0.38
+    },
+    "tools": ["vectorbt", "freqtrade", "backtrader"]
+  },
+
+  "test_phases": [
+    {
+      "phase": 0, "name": "backtesting", "tool": "vectorbt",
+      "duration_weeks": {"min": 2, "max": 4},
+      "gate": {"sharpe_min": 1.0, "max_drawdown_max": 0.20, "min_trades": 500, "atr_sl_validated": true}
+    },
+    {
+      "phase": 1, "name": "paper_trading", "platform": "binance_testnet",
+      "duration_weeks": 4,
+      "gate": {"win_rate_min": 0.43, "expected_value_positive": true, "non_fill_rate_max": 0.30}
+    },
+    {
+      "phase": 2, "name": "live_small", "capital_eur": {"min": 100, "max": 200},
+      "duration_weeks": {"min": 4, "max": 8},
+      "gate": {"min_real_trades": 30, "expected_value_positive_net": true}
+    },
+    {
+      "phase": 3, "name": "scale",
+      "trigger": "2_consecutive_positive_months", "action": "increase_capital"
+    }
+  ],
+
+  "tech_stack": {
+    "language": "python",
+    "python_version": "3.11",
+    "key_libraries": ["python-binance OR ccxt", "pandas", "numpy", "ta-lib", "asyncio", "websockets", "sqlite3"],
+    "exchange_api": "binance_futures",
+    "macro_data": ["yfinance", "FRED"],
+    "sentiment_api": "alternative.me",
+    "onchain_free": "glassnode_basic",
+    "onchain_realtime": "binance_futures_api",
+    "onchain_optional": "coinalyze",
+    "backtesting": "vectorbt",
+    "logging_db": "sqlite3",
+    "logging_llm": "claude_api_sonnet_weekly_review_only",
+    "hosting": "docker_on_vps_hetzner",
+    "alerting": "telegram_bot",
+    "state_storage": "json_file_with_sqlite_fallback"
+  },
+
+  "costs": {
+    "vps_eur_per_month": {"min": 4, "max": 8},
+    "claude_api_eur_per_week": {"min": 0.50, "max": 2.0, "note": "Nur wöchentlicher Review – NICHT pro 15-min-Zyklus"},
+    "coinalyze_usd_per_month": {"min": 10, "max": 20, "optional": true},
+    "binance_maker_fee_pct": 0.0002,
+    "binance_taker_fee_pct": 0.0004,
+    "initial_live_capital_eur": {"min": 100, "max": 200}
+  },
+
+  "expected_performance": {
+    "trades_per_week": {"min": 0, "max": 4, "realistic_avg": 1.5, "note": "In Ranging-Märkten (60-70% der Zeit) oft 0-1 Trades/Woche"},
+    "win_rate_pct": {"min": 0.43, "max": 0.52},
+    "rrr": 3.0,
+    "monthly_return_net_pct": {"min": 0.015, "max": 0.04, "note": "v3 war 2-7% – realistischer: 1.5-4% nach Funding, Fees, inaktiven Wochen"},
+    "max_drawdown_pct": {"min": 0.08, "max": 0.15},
+    "sharpe_ratio_target_min": 1.0,
+    "break_even_win_rate_gross": 0.25,
+    "break_even_win_rate_net_with_costs": 0.33
+  },
+
+  "logging": {
+    "per_trade_fields": ["entry_price", "exit_price", "side", "qty", "sl", "tp", "pnl_usdt", "pnl_pct", "fees_usdt", "funding_paid_usdt", "regime", "score", "hold_duration_hours", "exit_reason"],
+    "per_signal_fields": ["timestamp", "symbol", "score_total", "score_breakdown", "regime", "macro_direction", "action"],
+    "risk_gate_log": true,
+    "api_error_log": true,
+    "websocket_reconnect_log": true,
+    "heartbeat_log": true,
+    "storage": "sqlite3",
+    "llm_review": {"frequency": "weekly", "model": "claude-sonnet", "purpose": "Performance-Analyse, Anomalie-Erkennung, Verbesserungsvorschläge"},
+    "llm_used_for_live_decisions": false
+  },
+
+  "known_weaknesses": [
+    {"id": "black_swan",            "severity": "HIGH",   "mitigation": ["isolated_margin", "hard_cap_20pct", "atr_3x_auto_stop", "emergency_stop_killswitch"]},
+    {"id": "state_corruption",      "severity": "HIGH",   "mitigation": ["atomic_json_write", "backup_before_overwrite", "startup_reconciliation"]},
+    {"id": "websocket_disconnect",  "severity": "HIGH",   "mitigation": ["auto_reconnect_exponential_backoff", "listen_key_renewal_30min", "watchdog"]},
+    {"id": "sl_placement_failure",  "severity": "HIGH",   "mitigation": ["retry_5x_exponential", "emergency_close_on_all_retries_failed"]},
+    {"id": "atr_sl_slippage",       "severity": "MEDIUM", "mitigation": ["atr_multiplier_cap_1_5", "mark_price_workingType"]},
+    {"id": "non_fill_risk",         "severity": "MEDIUM", "mitigation": ["timeout_2_candles", "no_market_fallback", "rescore_next_cycle"]},
+    {"id": "overfitting",           "severity": "MEDIUM", "mitigation": ["walk_forward", "monte_carlo", "sensitivity_analysis"]},
+    {"id": "funding_cost_drag",     "severity": "MEDIUM", "mitigation": ["block_if_funding_gt_0_05pct", "net_ew_calculation", "48h_max_hold"]},
+    {"id": "liquidation_via_fees",  "severity": "MEDIUM", "mitigation": ["liquidation_price_monitor_30s", "10pct_buffer_alert", "5pct_emergency_close"]},
+    {"id": "api_rate_limit_ban",    "severity": "MEDIUM", "mitigation": ["websocket_reduces_rest_calls", "rate_limit_header_check", "backoff_on_429"]},
+    {"id": "stale_macro_data",      "severity": "LOW",    "mitigation": ["timestamp_check_26h", "fallback_BEIDE_direction"]},
+    {"id": "glassnode_delay",       "severity": "LOW",    "mitigation": ["layer1_only_daily"]},
+    {"id": "scoring_not_validated", "severity": "LOW",    "mitigation": ["backtesting_required", "sensitivity_analysis_in_backtest"]},
+    {"id": "tax_complexity_de",     "severity": "LOW",    "mitigation": ["sqlite_trade_log", "threshold_600_eur_year"]}
+  ]
+}
