@@ -335,11 +335,26 @@ async def trigger_scoring_cycle(symbol: str, kline_data: dict = None):
         )
 
         if not result.signal:
-            logger.debug(f"Kein Signal für {symbol} (Score: {result.score})")
+            msg = (
+                f"⏸ Kein Trade | {symbol}\n"
+                f"Score: {result.score} (zu niedrig für Signal)\n"
+                f"Richtung: {result.direction or 'keine'} | Regime: {result.regime}\n"
+                f"Makro: {macro_direction} | FundingRate: {funding_rate:.4%}\n"
+                f"F&G Index: {fg_index:.0f} | ATR-Ratio: {result.atr_ratio:.2f}"
+            )
+            logger.info(f"Kein Signal für {symbol} (Score: {result.score}, Richtung: {result.direction}, Regime: {result.regime})")
+            notifier.send_info(msg)
             return
 
         if not gate_passed:
+            msg = (
+                f"🚫 Trade blockiert | {symbol}\n"
+                f"Grund: {reject_reason}\n"
+                f"Score: {result.score} | Richtung: {result.direction}\n"
+                f"Makro: {macro_direction} | Regime: {result.regime}"
+            )
             logger.info(f"Risk-Gate blockiert Entry: {reject_reason}")
+            notifier.send_warning(msg)
             return
 
         # ─── Trade eröffnen ─────────────────────────────────────────────────

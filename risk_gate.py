@@ -106,7 +106,7 @@ def check_all(state_ref, market: MarketData, symbol_filters: SymbolFilters,
 
         if not passed:
             logger.info(f"Risk-Gate BLOCKIERT [{check_name}]: {fail_message}")
-            return False, check_name
+            return False, fail_message
 
     logger.debug("Risk-Gate: Alle Checks bestanden ✓")
     return True, None
