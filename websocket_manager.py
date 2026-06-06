@@ -121,8 +121,7 @@ async def _run_market_stream():
 
             async with websockets.connect(
                 stream_url,
-                ping_interval=20,
-                ping_timeout=30,
+                ping_interval=None,
                 close_timeout=10,
             ) as ws:
                 # Erfolgreich verbunden – Delay zurücksetzen
@@ -190,8 +189,7 @@ async def _run_user_data_stream():
 
             async with websockets.connect(
                 ws_url,
-                ping_interval=20,
-                ping_timeout=30,
+                ping_interval=None,
                 close_timeout=10,
             ) as ws:
                 delay_index = 0
@@ -285,16 +283,16 @@ async def _process_market_message(data: dict):
         kline = payload.get("k", {})
         interval = kline.get("i")
         is_closed = kline.get("x", False)
+        symbol = kline.get("s")
+        logger.info(f"Kline empfangen: {symbol} {interval} closed={is_closed}")
 
         if is_closed:
             if interval == "15m" and _on_kline_15m_closed:
-                symbol = kline.get("s")
-                logger.debug(f"15m Kerze geschlossen: {symbol}")
+                logger.info(f"15m Kerze geschlossen: {symbol}")
                 asyncio.create_task(_on_kline_15m_closed(symbol, kline))
 
             elif interval == "4h" and _on_kline_4h_closed:
-                symbol = kline.get("s")
-                logger.debug(f"4h Kerze geschlossen: {symbol}")
+                logger.info(f"4h Kerze geschlossen: {symbol}")
                 asyncio.create_task(_on_kline_4h_closed(symbol, kline))
 
 

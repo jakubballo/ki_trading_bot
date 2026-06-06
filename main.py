@@ -165,6 +165,9 @@ async def startup() -> bool:
     # Initiale Makro-Analyse (im Hintergrund)
     asyncio.create_task(_initial_macro_update())
 
+    # Timer-Fallback: Scoring alle 15 Minuten unabhängig vom WebSocket
+    asyncio.create_task(_scoring_timer())
+
     logger.info("Startup erfolgreich abgeschlossen ✓")
     return True
 
@@ -232,6 +235,31 @@ async def _initial_macro_update():
         logger.info(f"Makro-Richtung: {direction} (Confidence: {confidence:.2f})")
     except Exception as e:
         logger.error(f"Initiale Makro-Analyse fehlgeschlagen: {e}")
+
+
+async def _scoring_timer():
+    """
+    Timer-Fallback: Triggert den Scoring-Zyklus alle 15 Minuten.
+    Wartet bis zur nächsten vollen 15m-Kerze, dann alle 15 Minuten.
+    Läuft parallel zum WebSocket-Trigger als Absicherung.
+    """
+    import time as time_module
+
+    # Warten bis zur nächsten 15m-Kerzengrenze (:00, :15, :30, :45)
+    now = time_module.time()
+    seconds_in_15m = 15 * 60
+    wait = seconds_in_15m - (now % seconds_in_15m)
+    logger.info(f"Scoring-Timer: Erster Zyklus in {wait:.0f}s")
+    await asyncio.sleep(wait)
+
+    while not _kill_switch_active:
+        try:
+            for symbol in config.symbols:
+                logger.info(f"Scoring-Timer: Triggere Zyklus für {symbol}")
+                asyncio.create_task(trigger_scoring_cycle(symbol))
+        except Exception as e:
+            logger.error(f"Scoring-Timer Fehler: {e}")
+        await asyncio.sleep(seconds_in_15m)
 
 
 # ─── SCORING-ZYKLUS (alle 15 Minuten) ───────────────────────────────────────
