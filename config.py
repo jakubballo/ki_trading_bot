@@ -18,7 +18,7 @@ CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "ki_trading_bot_v4_config.json"
 
 # Standard-Konfiguration falls keine Datei vorhanden
 DEFAULT_CONFIG = {
-    "symbols": ["BTCUSDT"],
+    "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT"],
     "leverage": 3,
     "margin_type": "ISOLATED",
     "trading_mode": os.environ.get("TRADING_MODE", "paper"),

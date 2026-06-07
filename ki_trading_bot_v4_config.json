@@ -1,4 +1,6 @@
 {
+  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT"],
+
   "meta": {
     "schema_version": "4.0.0",
     "created_utc": "2026-06-04T00:00:00Z",
