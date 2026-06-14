@@ -87,7 +87,8 @@ async def place_entry_order(symbol: str, side: str, qty: float,
         logger.error("Entry-Order konnte nicht platziert werden")
         return None
 
-    order_id = order.get("orderId")
+    # Kraken gibt string-UUID zurück, Paper-Orders: "paper_TIMESTAMP"
+    order_id = order.get("orderId") or order.get("order_id") or order.get("uid")
     state.open_position.entry_order_id = str(order_id)
     state.write_on_event("order_placed")
 
@@ -145,13 +146,20 @@ async def _wait_for_fill(symbol: str, order_id, timeout: int = ENTRY_ORDER_TIMEO
 
             # REST-Fallback: Order-Status prüfen
             order_status = await exchange.get_order_status(symbol, order_id)
-            if order_status and order_status.get("status") == "FILLED":
+            # Kraken status: "filled" | Binance: "FILLED" | Paper: "FILLED"
+            status = (order_status.get("status") or "").upper()
+            if order_status and status in ("FILLED", "FULLY_EXECUTED"):
                 logger.info(f"Order {order_id} via REST-Poll gefüllt")
+                qty   = float(order_status.get("executedQty") or
+                              order_status.get("filledSize") or 0)
+                price = float(order_status.get("avgPrice") or
+                              order_status.get("last_price") or
+                              order_status.get("price") or 0)
                 return {
                     "symbol": symbol,
                     "side": order_status.get("side"),
-                    "qty": float(order_status.get("executedQty", 0)),
-                    "price": float(order_status.get("avgPrice", order_status.get("price", 0))),
+                    "qty": qty,
+                    "price": price,
                     "order_id": order_id,
                 }
 
@@ -163,24 +171,22 @@ async def _wait_for_fill(symbol: str, order_id, timeout: int = ENTRY_ORDER_TIMEO
 
 async def on_fill_event(event: dict):
     """
-    Callback vom WebSocket-Manager wenn eine ORDER_TRADE_UPDATE kommt.
-    Wird aufgerufen für ALLE Order-Updates – filtert intern nach Entry-Orders.
+    Callback vom WebSocket-Manager / Paper-Fill-Simulator.
+    Unterstützt beide Formate: Kraken WS und Paper-Order-Dicts.
     """
     try:
-        order_data = event.get("o", event)  # Binance WebSocket Format
-        order_id = str(order_data.get("i", ""))
-        order_status = order_data.get("X", "")
+        # Kraken Paper-Order / normalisiertes Format
+        order_id    = str(event.get("order_id") or event.get("orderId") or "")
+        status      = (event.get("status") or "").upper()
+        symbol      = event.get("symbol")
+        side        = event.get("side")
+        qty         = float(event.get("qty") or event.get("filledSize") or 0)
+        price       = float(event.get("price") or event.get("avg_price") or 0)
 
-        # WebSocket-Waiter signalisieren
         from websocket_manager import signal_fill_waiter
-        if order_status == "FILLED":
-            fill_data = {
-                "symbol": order_data.get("s"),
-                "side": order_data.get("S"),
-                "qty": float(order_data.get("z", 0)),
-                "price": float(order_data.get("ap", 0)),
-                "order_id": order_id,
-            }
+        if status in ("FILLED", "FULLY_EXECUTED") and order_id:
+            fill_data = {"symbol": symbol, "side": side, "qty": qty,
+                         "price": price, "order_id": order_id}
             signal_fill_waiter(order_id, fill_data)
 
     except Exception as e:
@@ -251,7 +257,8 @@ async def _set_sl_with_retry(symbol: str, side: str, sl_price: float, qty: float
         try:
             order = await exchange.place_stop_market(symbol, side, sl_price)
             if order:
-                state.open_position.sl_order_id = str(order.get("orderId"))
+                state.open_position.sl_order_id = str(
+                    order.get("orderId") or order.get("order_id") or "")
                 state.write_on_event("sl_set")
                 logger.info(f"SL gesetzt: {symbol} @ {sl_price:.4f} (Versuch {attempt + 1})")
                 return
@@ -284,7 +291,8 @@ async def _set_tp_with_retry(symbol: str, side: str, tp_price: float):
         try:
             order = await exchange.place_take_profit_market(symbol, side, tp_price)
             if order:
-                state.open_position.tp_order_id = str(order.get("orderId"))
+                state.open_position.tp_order_id = str(
+                    order.get("orderId") or order.get("order_id") or "")
                 state.write_on_event("tp_set")
                 logger.info(f"TP gesetzt: {symbol} @ {tp_price:.4f} (Versuch {attempt + 1})")
                 return

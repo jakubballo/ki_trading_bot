@@ -1,0 +1,30 @@
+{
+  "bot_id": 20,
+  "symbol": "PF_XRPUSD",
+  "strategy": "scalper",
+  "variant": "standard",
+  "paper_trading": true,
+  "macro_mode": "invert",
+  "telegram": false,
+  "protected": false,
+  "risk_per_trade": 0.01,
+  "atr_sl_multiplier": 1.5,
+  "atr_tp_multiplier": 3.0,
+  "min_score_long": 3.0,
+  "min_score_short": 3.0,
+  "adx_chop_threshold": 18.0,
+  "funding_rate_limit": 0.0005,
+  "ml": {
+    "enabled": true,
+    "veto_threshold": 0.42
+  },
+  "pbt_mutable": {
+    "risk_per_trade": 0.01,
+    "min_score_long": 3.0,
+    "min_score_short": 3.0,
+    "atr_sl_multiplier": 1.5,
+    "atr_tp_multiplier": 3.0,
+    "adx_chop_threshold": 18.0,
+    "funding_rate_limit": 0.0005
+  }
+}

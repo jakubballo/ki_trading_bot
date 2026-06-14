@@ -100,11 +100,22 @@ async def _check_liquidation_risk(pos):
             return
 
         # Liquidation-Preis aus Position-Risk holen
+        # Kraken: kein explizites liquidationPrice – aus Hebel und Entry schätzen
         pos_risk = await exchange.get_position_risk(pos.symbol)
-        if not pos_risk:
-            return
+        liq_price = 0.0
+        if pos_risk:
+            liq_price = float(pos_risk.get("liquidationPrice") or
+                              pos_risk.get("liq_price") or 0)
 
-        liq_price = float(pos_risk.get("liquidationPrice", 0))
+        # Schätzung wenn nicht verfügbar (konservativ: 80% der Bewegung bis Liq)
+        if liq_price <= 0 and pos.entry_price and pos.side:
+            leverage = config.risk.get("leverage", 5)
+            safety   = 1.0 / leverage
+            if pos.side == "BUY":
+                liq_price = pos.entry_price * (1 - safety)
+            else:
+                liq_price = pos.entry_price * (1 + safety)
+
         if liq_price <= 0:
             return
 
@@ -184,7 +195,11 @@ async def _check_sl_tp_orders(pos):
     """
     try:
         open_orders = await exchange.get_open_orders(pos.symbol)
-        order_ids = {str(o.get("orderId")) for o in open_orders}
+        # Kraken: "order_id" | Binance/Paper: "orderId"
+        order_ids = {
+            str(o.get("orderId") or o.get("order_id") or "")
+            for o in open_orders
+        }
 
         # SL prüfen
         if pos.sl_order_id and str(pos.sl_order_id) not in order_ids:

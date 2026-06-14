@@ -1,18 +1,39 @@
+# Wird vom Root-Level .gitignore abgedeckt.
+# Diese Datei existiert als Fallback falls ki_trading_bot/ als eigenständiges Repo genutzt wird.
+
 .env
-.env.local
-.env.*.local
+.env.*
 *.env
+.env.local
 
-# Datenbank & State
-data/
+data/network.db
+data/network.db-wal
+data/network.db-shm
+data/trades.db
+data/*.db-wal
+data/*.db-shm
+data/history/
+data/ml_models/
+data/bot*/
+data/bot_state.json
+data/bot_state.backup.json
+data/brain_state.json
+data/heartbeat.json
+data/instruments_cache.json
+data/dashboard.html
+data/threshold_sweep.txt
+data/regime_gate_test.txt
+data/walkforward.txt
+
 logs/
-*.db
+*.log
 
-# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyd
 *.pyo
+.pytest_cache/
 
-# SSH Keys
-*.pem
-*.key
+*.tmp
+*.bak
+*.backup

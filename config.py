@@ -1,98 +1,181 @@
 """
-config.py – Lädt und verwaltet die Bot-Konfiguration aus ki_trading_bot_v4_config.json
+config.py – Lädt und verwaltet die Bot-Konfiguration.
+Unterstützt --config Argument und BOT_CONFIG Umgebungsvariable für Multi-Bot-Betrieb.
 """
 
+import copy
 import json
 import os
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
-# .env laden
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Pfad zur Konfigurationsdatei
-CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", "ki_trading_bot_v4_config.json"))
+# Config-Pfad: Reihenfolge: BOT_CONFIG env > CONFIG_PATH env > Default
+# Fallback bots/bot1.json (gültige Kraken-Config) – NICHT die alte Binance-Spec
+# ki_trading_bot_v4_config.json (die ist nur noch Referenz-Dokument).
+_config_path_str = (
+    os.environ.get("BOT_CONFIG") or
+    os.environ.get("CONFIG_PATH") or
+    "bots/bot1.json"
+)
+CONFIG_PATH = Path(_config_path_str)
 
-# Standard-Konfiguration falls keine Datei vorhanden
+BOT_ID = int(os.environ.get("BOT_ID", "0"))
+
 DEFAULT_CONFIG = {
-    "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT"],
+    "bot_id": BOT_ID,
+    "symbols": ["PF_XBTUSD", "PF_ETHUSD"],
+    "strategy": "momentum",       # momentum | mean_reversion | breakout | contrarian | scalper
+    "macro_mode": "filter",       # filter | both | invert
+    # Fix 4: Entry nur wenn 4h-Regime die Richtung stützt. AKTIV (Walk-Forward 2026-06-13:
+    # half 5/5 Symbolen, +50% Δ PnL). mean_reversion automatisch ausgenommen. Reversibel: False.
+    "require_4h_regime_confirmation": True,
     "leverage": 3,
-    "margin_type": "ISOLATED",
     "trading_mode": os.environ.get("TRADING_MODE", "paper"),
 
-    # Risiko-Parameter
     "risk": {
-        "max_position_size_pct": 0.10,       # Max 10% des Kapitals pro Trade
-        "daily_loss_limit_pct": 0.03,         # 3% täglicher Verlust-Stop
-        "max_hold_hours": 48,                  # Max Haltedauer in Stunden
-        "sl_atr_multiplier": 2.0,             # SL = Einstieg ± 2x ATR
-        "tp_atr_multiplier": 3.0,             # TP = Einstieg ± 3x ATR
-        "max_atr_ratio": 3.0,                  # Extreme Volatilität: ATR > 3x Durchschnitt
-        "max_funding_rate": 0.0005,            # Max Funding Rate für Entry
-        "max_consecutive_negative_weeks": 3,   # Weekly Stop nach 3 Verlustwochen
+        "risk_per_trade": 0.01,         # Anteil des Kapitals, der pro Trade riskiert wird
+        "max_position_size_pct": 0.10,  # Notional-Cap (× Hebel) als Sicherheitsgrenze
+        "daily_loss_limit_pct": 0.03,
+        "max_hold_hours": 48,
+        "sl_atr_multiplier": 1.5,
+        "tp_atr_multiplier": 2.0,
+        "max_atr_ratio": 3.0,
+        "max_funding_rate": 0.0005,
+        "max_consecutive_negative_weeks": 3,
+        "fee_taker": 0.0005,      # 0.05% Taker-Gebühr
+        "fee_slippage": 0.0002,   # 0.02% Slippage-Puffer
     },
 
-    # Scoring-Schwellwerte
     "scoring": {
-        "min_score_long": 3,
-        "min_score_short": -3,
+        "min_score_long": 5,
+        "min_score_short": -5,
     },
 
-    # Technische Indikatoren
     "indicators": {
         "adx_period": 14,
-        "adx_trend_threshold": 25,            # ADX > 25 = Trending
+        "adx_trend_threshold": 25,
+        "adx_chop_threshold": 18,  # ADX < 18 = Chop
         "atr_period": 14,
     },
 
-    # Daten-Einstellungen
-    "data": {
-        "macro_stale_hours": 26,              # Makro-Daten veraltet nach 26h
-        "kline_limit": 200,                    # Anzahl Kerzen für Indikatoren
+    "ml": {
+        "veto_threshold": 0.42,       # P(win) < Schwelle → Signal verworfen
+        "min_samples_symbol": 50,     # Min Samples für Symbol-Modell
+        "min_samples_base": 20,       # Min Samples für Basis-Modell
+        "retrain_every_n": 50,        # Retrain alle N neuen Outcomes
+        "weight_real": 1.0,
+        "weight_shadow": 0.5,
+        "weight_synthetic": 0.2,
     },
 
-    # Datei-Pfade
+    "pbt_mutable": False,             # Darf der PBT-Selektor diese Config ändern?
+
+    "data": {
+        "macro_stale_hours": 26,
+        "kline_limit": 200,
+    },
+
     "paths": {
         "state_file": "data/bot_state.json",
         "heartbeat_file": "data/heartbeat.json",
         "db_file": "data/trades.db",
         "log_dir": "logs",
+        "network_db": "data/network.db",
+        "models_dir": "data/models",
     },
 }
 
 
 class Config:
-    """Konfigurationsklasse – lädt JSON-Config und merged mit Defaults."""
+    """Konfigurationsklasse für eine Bot-Instanz."""
 
     def __init__(self):
-        self._data = DEFAULT_CONFIG.copy()
+        self._data = copy.deepcopy(DEFAULT_CONFIG)
         self._load_from_file()
+        self._normalize_bot_config()
         self._override_from_env()
+        self._ensure_bot_paths()
 
     def _load_from_file(self):
-        """Lädt Konfiguration aus JSON-Datei, falls vorhanden."""
         if CONFIG_PATH.exists():
             try:
                 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                     file_config = json.load(f)
                 self._deep_merge(self._data, file_config)
-                logger.info(f"Konfiguration geladen aus: {CONFIG_PATH}")
+                logger.info(f"Config geladen: {CONFIG_PATH}")
             except Exception as e:
-                logger.warning(f"Fehler beim Laden der Config-Datei: {e} – Verwende Defaults")
+                logger.warning(f"Config-Datei Fehler: {e} – Verwende Defaults")
         else:
-            logger.info(f"Keine Config-Datei gefunden ({CONFIG_PATH}) – Verwende Defaults")
+            logger.info(f"Keine Config-Datei ({CONFIG_PATH}) – Verwende Defaults")
+
+    def _normalize_bot_config(self):
+        """
+        Übersetzt das FLACHE Bot-Config-Schema (symbol, min_score_long,
+        atr_sl_multiplier, risk_per_trade, ...) in die VERSCHACHTELTE Struktur,
+        die der restliche Code liest (symbols, scoring.*, risk.*, indicators.*).
+
+        Die flachen Keys sind die Quelle der Wahrheit – PBT (brain.py) und
+        Learning Factory schreiben/lesen sie. Dieser Layer ist die EINZIGE
+        Stelle, an der übersetzt wird. Ohne ihn wurden alle Bot-spezifischen
+        Werte still ignoriert (alle Bots liefen mit Default-Symbolen + Defaults).
+        """
+        d = self._data
+
+        # Symbol (Singular) → symbols-Liste. Jeder Bot handelt GENAU sein Symbol.
+        if isinstance(d.get("symbol"), str):
+            d["symbols"] = [d["symbol"]]
+
+        # Scoring-Schwellen (oberste Ebene → scoring-Block)
+        d.setdefault("scoring", {})
+        if "min_score_long" in d:
+            d["scoring"]["min_score_long"] = d["min_score_long"]
+        if "min_score_short" in d:
+            # Bot-Configs speichern die Short-Schwelle positiv (z.B. 6.0);
+            # die Scoring-Logik braucht sie negativ (Short bei score <= -6).
+            d["scoring"]["min_score_short"] = -abs(d["min_score_short"])
+
+        # Risk-Parameter (oberste Ebene → risk-Block)
+        d.setdefault("risk", {})
+        if "risk_per_trade" in d:
+            d["risk"]["risk_per_trade"] = d["risk_per_trade"]
+        if "atr_sl_multiplier" in d:
+            d["risk"]["sl_atr_multiplier"] = d["atr_sl_multiplier"]
+        if "atr_tp_multiplier" in d:
+            d["risk"]["tp_atr_multiplier"] = d["atr_tp_multiplier"]
+        if "funding_rate_limit" in d:
+            d["risk"]["max_funding_rate"] = d["funding_rate_limit"]
+        # Hebel konsistent halten (config.leverage UND risk.leverage lesen ihn)
+        if "leverage" in d:
+            d["risk"]["leverage"] = d["leverage"]
+
+        # ADX-Chop-Schwelle (oberste Ebene → indicators-Block)
+        d.setdefault("indicators", {})
+        if "adx_chop_threshold" in d:
+            d["indicators"]["adx_chop_threshold"] = d["adx_chop_threshold"]
 
     def _override_from_env(self):
-        """Überschreibt kritische Werte aus Umgebungsvariablen."""
-        trading_mode = os.environ.get("TRADING_MODE")
-        if trading_mode:
-            self._data["trading_mode"] = trading_mode
+        if os.environ.get("TRADING_MODE"):
+            self._data["trading_mode"] = os.environ["TRADING_MODE"]
+        if os.environ.get("BOT_ID"):
+            self._data["bot_id"] = int(os.environ["BOT_ID"])
+
+    def _ensure_bot_paths(self):
+        """Leitet bot-spezifische Pfade aus bot_id ab wenn nicht explizit gesetzt."""
+        bot_id = self._data.get("bot_id", 0)
+        if bot_id and bot_id > 0:
+            paths = self._data["paths"]
+            # Nur setzen wenn noch Default-Pfade (keine bot-spezifischen)
+            paths["state_file"] = f"data/bot{bot_id}/bot_state.json"
+            paths["heartbeat_file"] = f"data/bot{bot_id}/heartbeat.json"
+            paths["db_file"] = f"data/bot{bot_id}/trades.db"
+            paths["log_dir"] = f"logs/bot{bot_id}"
 
     def _deep_merge(self, base: dict, override: dict):
-        """Merged override rekursiv in base dict."""
         for key, value in override.items():
             if key in base and isinstance(base[key], dict) and isinstance(value, dict):
                 self._deep_merge(base[key], value)
@@ -100,7 +183,6 @@ class Config:
                 base[key] = value
 
     def get(self, key: str, default=None):
-        """Holt einen Konfig-Wert per Punkt-Notation (z.B. 'risk.daily_loss_limit_pct')."""
         keys = key.split(".")
         data = self._data
         for k in keys:
@@ -116,10 +198,25 @@ class Config:
     def __contains__(self, key):
         return key in self._data
 
-    # Häufig verwendete Properties
+    @property
+    def bot_id(self) -> int:
+        return self._data.get("bot_id", 0)
+
     @property
     def symbols(self) -> list:
         return self._data["symbols"]
+
+    @property
+    def strategy(self) -> str:
+        return self._data.get("strategy", "momentum")
+
+    @property
+    def macro_mode(self) -> str:
+        return self._data.get("macro_mode", "filter")
+
+    @property
+    def require_4h_regime_confirmation(self) -> bool:
+        return bool(self._data.get("require_4h_regime_confirmation", False))
 
     @property
     def leverage(self) -> int:
@@ -153,6 +250,13 @@ class Config:
     def indicators(self) -> dict:
         return self._data["indicators"]
 
+    @property
+    def ml(self) -> dict:
+        return self._data.get("ml", {})
 
-# Globale Config-Instanz
+    @property
+    def pbt_mutable(self) -> bool:
+        return self._data.get("pbt_mutable", False)
+
+
 config = Config()

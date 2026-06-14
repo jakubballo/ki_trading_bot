@@ -19,6 +19,42 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # Rate-Limit: nicht öfter als 1 Nachricht pro 5 Sekunden
 RATE_LIMIT_SECONDS = 5
 
+# Quiet-Mode: pro Bot NUR Trade-Eröffnung/-Schließung + kritische Alerts senden.
+# Routine-Meldungen (Info/Warnung/Startup je Bot) werden unterdrückt.
+# Netzwerk-Start + Shutdown-Report kommen zentral aus network_manager.py.
+QUIET_MODE = True
+
+
+def send_telegram_sync(text: str) -> bool:
+    """
+    Synchroner Telegram-Sender (ohne Queue/Worker) – für network_manager.py.
+    Genau eine Nachricht, mit Retry bei 429. Nutzt requests.
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat  = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not (token and chat):
+        return False
+    try:
+        import requests
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat, "text": text,
+                   "parse_mode": "HTML", "disable_web_page_preview": True}
+        for attempt in range(4):
+            resp = requests.post(url, json=payload, timeout=10)
+            if resp.status_code == 200:
+                return True
+            if resp.status_code == 429:
+                try:
+                    retry_after = resp.json().get("parameters", {}).get("retry_after", 5)
+                except Exception:
+                    retry_after = 5
+                time.sleep(retry_after)
+            else:
+                return False
+        return False
+    except Exception:
+        return False
+
 # Emoji für verschiedene Nachrichtentypen
 EMOJI = {
     "info": "ℹ️",
@@ -81,7 +117,7 @@ class TelegramNotifier:
                 logger.error(f"Fehler im Telegram-Worker: {e}")
 
     async def _send_raw(self, text: str):
-        """Sendet eine Nachricht direkt an Telegram API."""
+        """Sendet eine Nachricht direkt an Telegram API. Retry bei 429."""
         if not self._enabled:
             logger.debug(f"[TELEGRAM DEAKTIVIERT] {text}")
             return
@@ -96,13 +132,24 @@ class TelegramNotifier:
                 "disable_web_page_preview": True,
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        resp_text = await resp.text()
-                        logger.error(f"Telegram API Fehler {resp.status}: {resp_text}")
-                    else:
-                        logger.debug("Telegram-Nachricht gesendet")
+            for attempt in range(4):
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            logger.debug("Telegram-Nachricht gesendet")
+                            return
+                        elif resp.status == 429:
+                            try:
+                                data = await resp.json()
+                                retry_after = data.get("parameters", {}).get("retry_after", 5)
+                            except Exception:
+                                retry_after = 5
+                            logger.warning(f"Telegram Rate-Limit – warte {retry_after}s (Versuch {attempt + 1}/4)")
+                            await asyncio.sleep(retry_after)
+                        else:
+                            resp_text = await resp.text()
+                            logger.error(f"Telegram API Fehler {resp.status}: {resp_text}")
+                            return
 
         except Exception as e:
             logger.error(f"Fehler beim Senden der Telegram-Nachricht: {e}")
@@ -128,22 +175,31 @@ class TelegramNotifier:
     # ─── Öffentliche API ────────────────────────────────────────────────────
 
     def send_info(self, message: str):
-        """Sendet eine Info-Nachricht (niedrige Priorität)."""
+        """Info-Nachricht. Im Quiet-Mode unterdrückt (nur Log)."""
+        if QUIET_MODE:
+            logger.debug(f"[TELEGRAM QUIET/info] {message}")
+            return
         text = f"{EMOJI['info']} <b>INFO</b>\n{message}\n<i>{_timestamp()}</i>"
         self._enqueue(text)
 
     def send_warning(self, message: str):
-        """Sendet eine Warnung (mittlere Priorität)."""
+        """Warnung. Im Quiet-Mode unterdrückt (nur Log)."""
+        if QUIET_MODE:
+            logger.debug(f"[TELEGRAM QUIET/warn] {message}")
+            return
         text = f"{EMOJI['warning']} <b>WARNUNG</b>\n{message}\n<i>{_timestamp()}</i>"
         self._enqueue(text)
 
     async def send_critical(self, message: str):
-        """Sendet einen kritischen Alert (hohe Priorität, wartet auf Zustellung)."""
+        """Kritischer Alert (Kill-Switch/Liquidation) – wird IMMER gesendet."""
         text = f"{EMOJI['critical']} <b>KRITISCH</b>\n{message}\n<i>{_timestamp()}</i>"
         await self._enqueue_and_wait(text)
 
     def send(self, message: str):
-        """Allgemeine Nachricht senden."""
+        """Allgemeine Nachricht. Im Quiet-Mode unterdrückt (nur Log)."""
+        if QUIET_MODE:
+            logger.debug(f"[TELEGRAM QUIET/send] {message}")
+            return
         self._enqueue(f"🤖 {message}\n<i>{_timestamp()}</i>")
 
     def send_trade_opened(self, symbol: str, side: str, entry_price: float,
