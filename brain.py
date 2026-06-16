@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import random
+import sys
 import time
 from copy import deepcopy
 from datetime import datetime, timezone, timedelta
@@ -78,6 +79,40 @@ def _atomic_write_json(path: Path, data: dict):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def _notify_training(label: str, ok: bool, detail: str = ""):
+    """Telegram-Benachrichtigung für Daten-/Trainings-Jobs.
+
+    ok=True  → '✅ <label> fertig' (+ Detail)
+    ok=False → '⚠️ <label> FEHLER' (+ Fehlertext)
+    Läuft synchron (send_telegram_sync) – brain hat keinen async-Queue-Kontext.
+    Fehler beim Senden dürfen den Job nicht abbrechen.
+    """
+    try:
+        from notifier import send_telegram_sync
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        if ok:
+            msg = f"✅ <b>{label} fertig</b> | {now_str}"
+            if detail:
+                msg += f"\n{detail}"
+        else:
+            msg = f"⚠️ <b>{label} FEHLER</b> | {now_str}\n{detail}"
+        send_telegram_sync(msg)
+    except Exception as e:
+        logger.warning(f"Telegram-Benachrichtigung ({label}) fehlgeschlagen: {e}")
+
+
+def _fmt_win(win: dict) -> str:
+    """Formatiert ein Win-Training-Status-Dict für die Telegram-Meldung."""
+    if not isinstance(win, dict):
+        return "?"
+    if win.get("skipped"):
+        return f"übersprungen ({win['skipped']})"
+    if win.get("ok") is False:
+        return f"Fehler ({win.get('error', 'unbekannt')})"
+    return (f"{win.get('symbol_models', '?')} Symbol-Modelle "
+            f"aus {win.get('rows', '?')} Zeilen")
 
 
 # ──────────────────────────── PBT ──────────────────────────── #
@@ -188,13 +223,26 @@ def _mutate_config(best_id: int, worst_id: int) -> dict | None:
 # ──────────────────────────── ML ──────────────────────────── #
 
 async def run_ml_check():
-    """Prüft ob ML-Retrain nötig, triggert wenn ja (non-blocking via Executor)."""
+    """Prüft ob ML-Retrain nötig, triggert wenn ja (non-blocking via Executor).
+
+    Telegram nur wenn tatsächlich (re)trainiert wurde – sonst stündlicher Spam.
+    """
     try:
         from ml_network import ml_network
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, ml_network.maybe_retrain)
+        result = await loop.run_in_executor(None, ml_network.maybe_retrain)
+        if not result:
+            return  # kein Retrain nötig → keine Meldung
+        if result.get("ok") is False:
+            _notify_training("ML-Retrain (stündlich)", ok=False,
+                             detail=result.get("error", "unbekannt"))
+        else:
+            detail = (f"{result.get('new_count', '?')} neue Outcomes → "
+                      f"{_fmt_win(result.get('win', {}))}")
+            _notify_training("ML-Retrain (stündlich)", ok=True, detail=detail)
     except Exception as e:
         logger.error(f"ML-Check Fehler: {e}")
+        _notify_training("ML-Retrain (stündlich)", ok=False, detail=str(e))
 
 
 async def run_ml_full_train():
@@ -203,25 +251,53 @@ async def run_ml_full_train():
     try:
         from ml_network import ml_network
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, ml_network.train_all)
+        result = await loop.run_in_executor(None, ml_network.train_all)
+        win    = (result or {}).get("win", {})
+        candle = (result or {}).get("candle", {})
+        if win.get("ok") is False or candle.get("ok") is False:
+            err = win.get("error") or candle.get("error") or "unbekannt"
+            _notify_training("ML-Full-Train", ok=False, detail=err)
+        else:
+            detail = (f"Win: {_fmt_win(win)}\n"
+                      f"Candle (Modell A): "
+                      f"{candle.get('trained', '?')}/{candle.get('total', '?')} Symbole")
+            _notify_training("ML-Full-Train", ok=True, detail=detail)
     except Exception as e:
         logger.error(f"ML-Full-Train Fehler: {e}")
+        _notify_training("ML-Full-Train", ok=False, detail=str(e))
 
 
 # ──────────────────────────── Learning Factory ──────────────────────────── #
 
 async def run_learning_factory():
-    """Startet die Learning Factory in separatem Prozess (blockiert nicht)."""
+    """Startet die Learning Factory als Subprozess und wartet (async) auf Abschluss.
+
+    Fix: sys.executable statt literal 'python' – auf der VPS gibt es kein 'python'
+    im systemd-PATH (nur .venv/bin/python). Das await blockiert den Event-Loop
+    nicht (anderer Prozess) und erlaubt eine echte Fertig-/Fehler-Meldung.
+    """
     logger.info("Nightly Learning Factory wird gestartet...")
     try:
-        import subprocess
-        proc = subprocess.Popen(
-            ["python", "learning_factory.py", "--quick"],
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "learning_factory.py", "--quick",
             cwd=str(Path(__file__).parent),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         logger.info(f"Learning Factory PID: {proc.pid}")
+        _, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            _notify_training("Learning Factory", ok=True,
+                             detail="Synthetik-Outcomes regeneriert")
+        else:
+            tail = (stderr.decode(errors="replace").strip().splitlines()
+                    or ["(keine Ausgabe)"])[-1]
+            _notify_training("Learning Factory", ok=False,
+                             detail=f"Exit-Code {proc.returncode}: {tail[:300]}")
+            logger.error(f"Learning Factory Exit {proc.returncode}: {tail}")
     except Exception as e:
         logger.error(f"Learning Factory Start Fehler: {e}")
+        _notify_training("Learning Factory", ok=False, detail=str(e))
 
 
 # ──────────────────────────── Tagesreport ──────────────────────────── #
@@ -336,13 +412,19 @@ async def _run_dashboard():
 
 
 async def _run_data_update():
-    """Daten-Update für alle Symbole."""
+    """Daten-Update für alle Symbole (inkrementell)."""
     logger.info("Nightly Daten-Update gestartet")
     try:
         from data_updater import run_update
-        await asyncio.get_running_loop().run_in_executor(None, run_update)
+        total = await asyncio.get_running_loop().run_in_executor(None, run_update)
+        n = total if total is not None else "?"
+        detail = f"{n} neue Kerzen"
+        if isinstance(total, int) and total > 500:
+            detail += " → Candle-Modell A nachtrainiert"
+        _notify_training("Daten-Update", ok=True, detail=detail)
     except Exception as e:
         logger.error(f"Daten-Update Fehler: {e}")
+        _notify_training("Daten-Update", ok=False, detail=str(e))
 
 
 async def run_llm_reflection():
@@ -450,13 +532,19 @@ async def _tracked(task_name: str, func):
 async def main():
     scheduler = AsyncIOScheduler(timezone="UTC")
 
-    # Interval-basiert (läuft unabhängig von Uhrzeit)
-    scheduler.add_job(lambda: asyncio.ensure_future(_tracked("pbt",              run_pbt)),              "interval", hours=24)
-    scheduler.add_job(lambda: asyncio.ensure_future(_tracked("data_update",      _run_data_update)),     "interval", hours=6)
-    scheduler.add_job(lambda: asyncio.ensure_future(_tracked("ml_full_train",    run_ml_full_train)),    "interval", hours=24)
-    scheduler.add_job(lambda: asyncio.ensure_future(_tracked("learning_factory", run_learning_factory)), "interval", hours=24)
-    scheduler.add_job(lambda: asyncio.ensure_future(_tracked("daily_report",     send_daily_report)),    "interval", hours=24)
-    scheduler.add_job(lambda: asyncio.ensure_future(_tracked("llm_reflection",   run_llm_reflection)),   "interval", days=7)
+    # Interval-basiert (läuft unabhängig von Uhrzeit).
+    # WICHTIG: _tracked direkt als Coroutine-Funktion übergeben (mit args=), NICHT
+    # via 'lambda: asyncio.ensure_future(...)'. Ein nicht-coroutine-Lambda lässt
+    # APScheduler den Job im Worker-Thread (AsyncIOExecutor → ThreadPool) laufen,
+    # wo asyncio.ensure_future() unter Python 3.14 mangels Event-Loop im Thread mit
+    # 'RuntimeError: There is no current event loop' crasht. Als Coroutine-Funktion
+    # erkennt der AsyncIOExecutor den Job und führt ihn direkt auf dem Loop aus.
+    scheduler.add_job(_tracked, "interval", hours=24, args=["pbt",              run_pbt])
+    scheduler.add_job(_tracked, "interval", hours=6,  args=["data_update",      _run_data_update])
+    scheduler.add_job(_tracked, "interval", hours=24, args=["ml_full_train",    run_ml_full_train])
+    scheduler.add_job(_tracked, "interval", hours=24, args=["learning_factory", run_learning_factory])
+    scheduler.add_job(_tracked, "interval", hours=24, args=["daily_report",     send_daily_report])
+    scheduler.add_job(_tracked, "interval", days=7,   args=["llm_reflection",   run_llm_reflection])
 
     # ML-Check und Dashboard bleiben stündlich (kurz, immer sinnvoll)
     scheduler.add_job(run_ml_check,   "interval", hours=1)

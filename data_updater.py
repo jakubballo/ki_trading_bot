@@ -197,6 +197,8 @@ def run_update(symbols: List[str] = None, full: bool = False):
         except Exception as e:
             logger.warning(f"ML-Training nach Update Fehler: {e}")
 
+    return total
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -338,20 +338,31 @@ class MLNetwork:
     # ────────────────── Training ──────────────────
 
     def maybe_retrain(self):
-        """Prüft ob neue network.db-Outcomes vorliegen → Win-Modell retrain."""
+        """Prüft ob neue network.db-Outcomes vorliegen → Win-Modell retrain.
+
+        Rückgabe: None wenn kein Retrain nötig war (keine Telegram-Meldung),
+        sonst Status-Dict {new_count, win:{...}} bzw. {ok:False, error}.
+        """
         try:
             from network_db import count_new_outcomes_since
             new_count = count_new_outcomes_since(self._last_trade_id)
             if new_count >= self._retrain_threshold:
                 logger.info(f"ML Retrain: {new_count} neue Outcomes")
-                self.train_win_models()
+                win = self.train_win_models()
+                return {"new_count": new_count, "win": win}
+            return None
         except Exception as e:
             logger.error(f"maybe_retrain Fehler: {e}")
+            return {"ok": False, "error": str(e)}
 
     def train_all(self):
-        """Vollständiges Training beider Modell-Typen (Win-Modell B + Candle-Modell A)."""
-        self.train_win_models()
-        self._train_all_candle_models()
+        """Vollständiges Training beider Modell-Typen (Win-Modell B + Candle-Modell A).
+
+        Rückgabe: Status-Dict {win:{...}, candle:{...}} für Telegram-Report.
+        """
+        win    = self.train_win_models()
+        candle = self._train_all_candle_models()
+        return {"win": win, "candle": candle}
 
     def _train_all_candle_models(self):
         """Trainiert Candle-Modell A aus CSVs für alle 5 Symbole.
@@ -389,9 +400,14 @@ class MLNetwork:
         if trained >= 2:
             self._rebuild_candle_base()
         logger.info(f"Candle-Training abgeschlossen: {trained}/{len(symbols)} Symbole")
+        return {"ok": True, "trained": trained, "total": len(symbols)}
 
     def train_win_models(self):
-        """Trainiert Win-Modelle (Modell B) aus network.db."""
+        """Trainiert Win-Modelle (Modell B) aus network.db.
+
+        Rückgabe: Status-Dict {ok, rows, symbol_models, secs} bzw.
+        {ok:True, skipped:...} bei zu wenig Daten oder {ok:False, error}.
+        """
         try:
             from network_db import get_training_data_balanced, get_max_trade_id
             # B2: pro Symbol gleich viele Zeilen statt globalem LIMIT
@@ -400,7 +416,7 @@ class MLNetwork:
             min_base = config.ml.get("min_samples_base", 200)
             if len(rows) < min_base:
                 logger.info(f"Win-Training: zu wenig Daten ({len(rows)} < {min_base})")
-                return
+                return {"ok": True, "skipped": f"zu wenig Daten ({len(rows)} < {min_base})"}
 
             logger.info(f"Win-Training gestartet: {len(rows)} Trades")
             t0 = time.time()
@@ -420,10 +436,14 @@ class MLNetwork:
                     self._save_model(m, f"win_{sym}")
 
             self._last_trade_id = get_max_trade_id()
-            logger.info(f"Win-Training: {time.time()-t0:.1f}s, "
+            secs = time.time() - t0
+            logger.info(f"Win-Training: {secs:.1f}s, "
                         f"{len(self._win_models)} Symbol-Modelle")
+            return {"ok": True, "rows": len(rows),
+                    "symbol_models": len(self._win_models), "secs": round(secs, 1)}
         except Exception as e:
             logger.error(f"Win-Training Fehler: {e}", exc_info=True)
+            return {"ok": False, "error": str(e)}
 
     def train_from_csv(self, symbol: str, csv_path: str):
         """
