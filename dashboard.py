@@ -20,26 +20,77 @@ logger = logging.getLogger("dashboard")
 OUTPUT_PATH = Path("data/dashboard.html")
 
 
+def _sharpe(pnls: list) -> float:
+    """Einfache Sharpe-Ratio aus einer PnL-Liste (0.0 bei <5 Werten)."""
+    if len(pnls) < 5:
+        return 0.0
+    avg = sum(pnls) / len(pnls)
+    std = (sum((p - avg) ** 2 for p in pnls) / len(pnls)) ** 0.5
+    return (avg / std) if std > 0 else 0.0
+
+
+def _aggregate_per_bot(rows: list) -> list:
+    """
+    Aggregiert geschlossene Trades zu Pro-Bot-Statistiken.
+    `rows` sind sqlite-Rows mit bot_id, symbol, strategy, pnl, closed_at.
+    Rückgabe: Liste von Bot-Dicts, sortiert nach Gesamt-PnL (absteigend).
+    """
+    per_bot: dict = defaultdict(lambda: {
+        "pnls": [], "symbol": "", "strategy": "",
+    })
+    for r in rows:
+        b = per_bot[r["bot_id"]]
+        b["pnls"].append(float(r["pnl"]))
+        b["symbol"] = r["symbol"] or ""
+        b["strategy"] = r["strategy"] or ""
+
+    out = []
+    for bid, b in per_bot.items():
+        pnls = b["pnls"]
+        n = len(pnls)
+        wins = sum(1 for p in pnls if p > 0)
+        out.append({
+            "bot_id":    bid,
+            "symbol":    b["symbol"],
+            "strategy":  b["strategy"],
+            "total":     n,
+            "wins":      wins,
+            "win_rate":  (wins / n) if n else 0.0,
+            "total_pnl": round(sum(pnls), 4),
+            "avg_pnl":   round(sum(pnls) / n, 4) if n else 0.0,
+            "best":      round(max(pnls), 4) if pnls else 0.0,
+            "worst":     round(min(pnls), 4) if pnls else 0.0,
+            "sharpe":    round(_sharpe(pnls), 3),
+        })
+    return sorted(out, key=lambda x: x["total_pnl"], reverse=True)
+
+
 def load_network_data() -> dict:
     """Lädt alle relevanten Daten aus network.db."""
-    from network_db import get_connection, get_all_bot_rankings
+    from network_db import get_connection
 
     conn = get_connection()
-    rankings = get_all_bot_rankings(min_trades=3)
 
-    # Equity-Kurven pro Bot (kumulierter PnL)
-    equity: dict = defaultdict(list)
-    trades_raw = conn.execute("""
-        SELECT bot_id, symbol, side, pnl, exit_reason, strategy, regime,
-               is_shadow, is_synthetic, closed_at
+    # Alle geschlossenen, nicht-synthetischen Trades einmal laden, dann in
+    # Python nach echt (is_shadow=0) vs. shadow (is_shadow=1) gruppieren.
+    all_rows = conn.execute("""
+        SELECT bot_id, symbol, strategy, pnl, is_shadow, closed_at
         FROM trades_network
         WHERE exit_price IS NOT NULL AND pnl IS NOT NULL
           AND is_synthetic = 0
         ORDER BY closed_at
     """).fetchall()
 
+    real_rows   = [r for r in all_rows if r["is_shadow"] == 0]
+    shadow_rows = [r for r in all_rows if r["is_shadow"] == 1]
+
+    real_bots   = _aggregate_per_bot(real_rows)
+    shadow_bots = _aggregate_per_bot(shadow_rows)
+
+    # Equity-Kurven pro Bot (kumulierter PnL) – nur echte Trades
+    equity: dict = defaultdict(list)
     running_pnl: dict = defaultdict(float)
-    for row in trades_raw:
+    for row in real_rows:
         bid = row["bot_id"]
         running_pnl[bid] += float(row["pnl"])
         equity[bid].append({
@@ -47,22 +98,12 @@ def load_network_data() -> dict:
             "pnl": round(running_pnl[bid], 4),
         })
 
-    # Netzwerk-Gesamtstatistik
-    total_row = conn.execute("""
-        SELECT COUNT(*) as n,
-               SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) as wins,
-               SUM(pnl) as total_pnl,
-               AVG(pnl) as avg_pnl
-        FROM trades_network
-        WHERE exit_price IS NOT NULL AND pnl IS NOT NULL
-          AND is_synthetic = 0 AND is_shadow = 0
-    """).fetchone()
-
-    shadow_row = conn.execute("""
-        SELECT COUNT(*) as n, SUM(pnl) as total_pnl
-        FROM trades_network
-        WHERE exit_price IS NOT NULL AND pnl IS NOT NULL AND is_shadow = 1
-    """).fetchone()
+    def _totals(bots: list) -> dict:
+        n = sum(b["total"] for b in bots)
+        wins = sum(b["wins"] for b in bots)
+        pnl = sum(b["total_pnl"] for b in bots)
+        return {"n": n, "wins": wins, "total_pnl": round(pnl, 4),
+                "bots": len(bots)}
 
     # Reflexionsregeln
     rules = conn.execute("""
@@ -73,46 +114,85 @@ def load_network_data() -> dict:
     conn.close()
 
     return {
-        "rankings":   rankings,
-        "equity":     dict(equity),
-        "total":      dict(total_row) if total_row else {},
-        "shadow":     dict(shadow_row) if shadow_row else {},
-        "rules":      [dict(r) for r in rules],
-        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "real_bots":   real_bots,
+        "shadow_bots": shadow_bots,
+        "real_total":  _totals(real_bots),
+        "shadow_total": _totals(shadow_bots),
+        "equity":      dict(equity),
+        "rules":       [dict(r) for r in rules],
+        "updated_at":  datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     }
+
+
+def _short_symbol(sym: str) -> str:
+    """PF_XBTUSD -> XBT für kompakte Anzeige."""
+    s = sym or ""
+    if s.startswith("PF_"):
+        s = s[3:]
+    if s.endswith("USD"):
+        s = s[:-3]
+    return s or "—"
+
+
+def _bot_table(bots: list, with_sharpe: bool) -> str:
+    """Baut die Pro-Bot-Tabelle (echte oder Shadow-Trades)."""
+    if not bots:
+        return "<p style='color:#8b949e;'>Noch keine Trades vorhanden.</p>"
+
+    sharpe_head = "<th>Sharpe</th>" if with_sharpe else ""
+    head = (f"<tr><th>Bot</th><th>Symbol</th><th>Strategie</th><th>Trades</th>"
+            f"<th>WR</th><th>∑PnL</th><th>Ø PnL</th><th>Best</th><th>Worst</th>"
+            f"{sharpe_head}</tr>")
+
+    body = ""
+    for r in bots:
+        pnl_color = "green" if r["total_pnl"] >= 0 else "red"
+        avg_color = "green" if r["avg_pnl"] >= 0 else "red"
+        sharpe_cell = f"<td>{r['sharpe']:.3f}</td>" if with_sharpe else ""
+        body += f"""
+        <tr>
+          <td>Bot #{r['bot_id']}</td>
+          <td>{_short_symbol(r['symbol'])}</td>
+          <td>{r['strategy']}</td>
+          <td>{r['total']}</td>
+          <td>{r['win_rate']*100:.0f}%</td>
+          <td style="color:{pnl_color};">{r['total_pnl']:+.4f}</td>
+          <td style="color:{avg_color};">{r['avg_pnl']:+.4f}</td>
+          <td class="green">{r['best']:+.4f}</td>
+          <td class="red">{r['worst']:+.4f}</td>
+          {sharpe_cell}
+        </tr>"""
+    return f"<table>{head}{body}</table>"
 
 
 def build_html(data: dict) -> str:
     """Generiert vollständige HTML-Seite."""
-    rankings  = data["rankings"]
-    equity    = data["equity"]
-    total     = data["total"]
-    shadow    = data["shadow"]
-    rules     = data["rules"]
-    updated   = data["updated_at"]
+    real_bots    = data["real_bots"]
+    shadow_bots  = data["shadow_bots"]
+    real_total   = data["real_total"]
+    shadow_total = data["shadow_total"]
+    equity       = data["equity"]
+    rules        = data["rules"]
+    updated      = data["updated_at"]
 
-    total_pnl = round(float(total.get("total_pnl") or 0), 4)
-    total_n   = int(total.get("n") or 0)
-    total_wins = int(total.get("wins") or 0)
-    wr_pct    = (total_wins / total_n * 100) if total_n else 0
+    # --- Echte Trades: Kennzahlen ---
+    r_pnl  = round(float(real_total.get("total_pnl") or 0), 4)
+    r_n    = int(real_total.get("n") or 0)
+    r_wins = int(real_total.get("wins") or 0)
+    r_wr   = (r_wins / r_n * 100) if r_n else 0
+    r_bots = int(real_total.get("bots") or 0)
 
-    # Equity-Kurven-Daten als JSON für Chart.js
+    # --- Shadow-Trades: Kennzahlen ---
+    s_pnl  = round(float(shadow_total.get("total_pnl") or 0), 4)
+    s_n    = int(shadow_total.get("n") or 0)
+    s_wins = int(shadow_total.get("wins") or 0)
+    s_wr   = (s_wins / s_n * 100) if s_n else 0
+    s_bots = int(shadow_total.get("bots") or 0)
+
     equity_json = json.dumps(equity)
 
-    # Rankings-Tabelle
-    ranking_rows = ""
-    for i, r in enumerate(rankings[:20]):
-        emoji = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else f"{i+1}."
-        pnl_color = "green" if r.get("total_pnl", 0) >= 0 else "red"
-        ranking_rows += f"""
-        <tr>
-          <td>{emoji}</td>
-          <td>Bot #{r['bot_id']}</td>
-          <td>{r.get('total', 0)}</td>
-          <td>{r.get('win_rate', 0)*100:.0f}%</td>
-          <td style="color:{pnl_color};">{r.get('total_pnl', 0):+.4f}</td>
-          <td>{r.get('sharpe', 0):.3f}</td>
-        </tr>"""
+    real_table   = _bot_table(real_bots, with_sharpe=True)
+    shadow_table = _bot_table(shadow_bots, with_sharpe=False)
 
     # Reflexionsregeln
     rules_html = ""
@@ -146,52 +226,85 @@ def build_html(data: dict) -> str:
   .rule-card {{ background:#161b22; border-left:3px solid #58a6ff; padding:10px; margin:8px 0; border-radius:4px; }}
   .rule-card small {{ color:#8b949e; }}
   .updated {{ color:#8b949e; font-size:0.85em; }}
+  .section {{ border-top:2px solid #30363d; margin-top:32px; padding-top:8px; }}
+  .section.real h2 {{ color:#3fb950; }}
+  .section.shadow h2 {{ color:#d29922; }}
+  .badge {{ font-size:0.5em; color:#8b949e; font-weight:normal; }}
 </style>
 </head>
 <body>
 <h1>🤖 Bot-Netzwerk Dashboard</h1>
 <p class="updated">Zuletzt aktualisiert: {updated}</p>
 
+<!-- ===================== ECHTE TRADES ===================== -->
+<div class="section real">
+<h2>💰 Echte Trades</h2>
+
 <div class="grid">
   <div class="card">
     <div>Gesamt PnL</div>
-    <div class="stat {'green' if total_pnl >= 0 else 'red'}">{total_pnl:+.4f}</div>
+    <div class="stat {'green' if r_pnl >= 0 else 'red'}">{r_pnl:+.4f}</div>
   </div>
   <div class="card">
     <div>Echte Trades</div>
-    <div class="stat">{total_n}</div>
+    <div class="stat">{r_n}</div>
   </div>
   <div class="card">
     <div>Win-Rate</div>
-    <div class="stat">{wr_pct:.0f}%</div>
+    <div class="stat">{r_wr:.0f}%</div>
   </div>
   <div class="card">
-    <div>Shadow-Trades</div>
-    <div class="stat">{int(shadow.get('n') or 0)}</div>
-    <small>PnL: {float(shadow.get('total_pnl') or 0):+.4f}</small>
-  </div>
-  <div class="card">
-    <div>Aktive Bots</div>
-    <div class="stat">{len(rankings)}</div>
+    <div>Bots mit Trades</div>
+    <div class="stat">{r_bots}</div>
   </div>
 </div>
 
-<h2>Equity-Kurven</h2>
+<h2>Equity-Kurven <span class="badge">(echte Trades)</span></h2>
 <div class="card">
   <canvas id="equityChart"></canvas>
 </div>
 
-<h2>Bot-Ranking (Top 20)</h2>
+<h2>Pro-Bot-Statistik <span class="badge">(alle Bots mit echten Trades)</span></h2>
 <div class="card">
-<table>
-  <tr><th>#</th><th>Bot</th><th>Trades</th><th>WR</th><th>∑PnL</th><th>Sharpe</th></tr>
-  {ranking_rows}
-</table>
+{real_table}
+</div>
 </div>
 
-<h2>LLM-Reflexionsregeln</h2>
+<!-- ===================== SHADOW-TRADES ===================== -->
+<div class="section shadow">
+<h2>👻 Shadow-Trades <span class="badge">(blockierte Signale, virtuell aufgelöst)</span></h2>
+
+<div class="grid">
+  <div class="card">
+    <div>Gesamt PnL</div>
+    <div class="stat {'green' if s_pnl >= 0 else 'red'}">{s_pnl:+.4f}</div>
+  </div>
+  <div class="card">
+    <div>Shadow-Trades</div>
+    <div class="stat">{s_n}</div>
+  </div>
+  <div class="card">
+    <div>Win-Rate</div>
+    <div class="stat">{s_wr:.0f}%</div>
+  </div>
+  <div class="card">
+    <div>Bots mit Shadows</div>
+    <div class="stat">{s_bots}</div>
+  </div>
+</div>
+
+<h2>Pro-Bot-Statistik <span class="badge">(alle Bots mit Shadow-Trades)</span></h2>
+<div class="card">
+{shadow_table}
+</div>
+</div>
+
+<!-- ===================== REFLEXION ===================== -->
+<div class="section">
+<h2>🧠 LLM-Reflexionsregeln</h2>
 <div class="card">
 {rules_html}
+</div>
 </div>
 
 <script>

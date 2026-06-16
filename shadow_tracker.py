@@ -6,6 +6,7 @@ Outcomes werden in network.db geschrieben (is_shadow=True).
 
 import asyncio
 import logging
+import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Optional
@@ -67,10 +68,20 @@ class ShadowTracker:
         """
         key = f"{symbol}_{side}"
 
-        # Bestehenden Shadow schließen (ersetzt)
+        # Bestehenden Shadow schließen (ersetzt) – DB-Eintrag als dedup_replaced markieren
         existing = self._open.get(key)
-        if existing and not existing.closed:
-            logger.debug(f"Shadow dedupe: {key} – alten Shadow ersetzt")
+        if existing and not existing.closed and existing.trade_id > 0:
+            try:
+                from network_db import update_network_trade_outcome
+                update_network_trade_outcome(
+                    trade_id=existing.trade_id,
+                    exit_price=entry_price,
+                    pnl=0.0,
+                    exit_reason="dedup_replaced",
+                )
+            except Exception as e:
+                logger.debug(f"Dedup-Close Fehler: {e}")
+            logger.debug(f"Shadow dedupe: {key} – alten Shadow geschlossen (ID={existing.trade_id})")
 
         d = details or {}
         try:
@@ -147,10 +158,25 @@ class ShadowTracker:
             tp_hit   = (is_long and mark_price >= shadow.tp_price) or \
                        (not is_long and mark_price <= shadow.tp_price)
 
+            # M2-Fix: SL/TP-Check VOR Timeout-Check. Wenn ein Shadow gleichzeitig
+            # SL/TP getroffen UND die Haltedauer überschritten hat, ist das echte
+            # Outcome der SL/TP-Hit (korrekter exit_reason + exit_price), nicht der
+            # mark-price-basierte Timeout.
             if sl_hit or tp_hit:
                 exit_price  = shadow.sl_price if sl_hit else shadow.tp_price
                 exit_reason = "sl" if sl_hit else "tp"
                 self._close_shadow(shadow, exit_price, exit_reason)
+                del self._open[key]
+                continue
+
+            try:
+                from config import config as _cfg
+                max_hold_secs = _cfg.risk.get("max_hold_hours", 48) * 3600
+            except Exception:
+                max_hold_secs = 48 * 3600
+
+            if _time.time() - shadow.opened_at > max_hold_secs:
+                self._close_shadow(shadow, mark_price, "timeout")
                 del self._open[key]
 
     def _close_shadow(self, shadow: ShadowTrade, exit_price: float, exit_reason: str):
@@ -160,7 +186,6 @@ class ShadowTracker:
 
         # PnL ohne Leverage (nur Preisdifferenz)
         if is_long:
-            pnl = shadow.entry_price - exit_price
             pnl = (exit_price - shadow.entry_price) / shadow.entry_price
         else:
             pnl = (shadow.entry_price - exit_price) / shadow.entry_price

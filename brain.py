@@ -33,7 +33,12 @@ logger = logging.getLogger("brain")
 
 BOTS_DIR          = Path("bots")
 PROTECTED_BOT_IDS = {1, 2}  # Referenz-Bots niemals überschreiben
-MIN_TRADES_PBT    = 20       # Mindest-Trades bevor PBT greift
+# H6-Fix: 20 war unerreichbar (bei ~3 Trades/Tag im Gesamtnetz bräuchte jeder Bot
+# 333 Tage) → PBT de facto deaktiviert. 5 macht PBT in der Anfangsphase wirksam.
+MIN_TRADES_PBT    = 5        # Mindest-Trades bevor PBT greift
+# H5-Fix: PBT bewertet nur die letzten N Tage (aktuelle Performance), nicht die
+# gesamte Laufzeit – sonst bleibt ein früh guter, jetzt schlechter Bot top-gerankt.
+PBT_LOOKBACK_DAYS = 7
 
 # Parameter die PBT mutieren darf
 PBT_MUTABLE_KEYS = [
@@ -56,6 +61,24 @@ MUTATION_RATES = {
     "funding_rate_limit":   0.00005,
 }
 
+# K-F: Strategie-spezifische Score-Schwellen dürfen nicht cross-strategy kopiert werden
+# (Breakout braucht 6, Momentum 3). Diese Keys nur übernehmen wenn gleiche Strategie.
+STRATEGY_SPECIFIC_KEYS = {"min_score_long", "min_score_short"}
+
+
+def _atomic_write_json(path: Path, data: dict):
+    """
+    K-G-Fix: Atomares Schreiben (.tmp → os.replace) verhindert korrupte JSON-Dateien
+    bei Absturz mitten im Schreiben. NTFS garantiert atomares Replace.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
 
 # ──────────────────────────── PBT ──────────────────────────── #
 
@@ -64,7 +87,10 @@ async def run_pbt():
     logger.info("PBT-Selektion gestartet")
     try:
         from network_db import get_all_bot_rankings, log_pbt_event
-        rankings = get_all_bot_rankings(min_trades=MIN_TRADES_PBT)
+        # H5-Fix: nur die letzten PBT_LOOKBACK_DAYS bewerten (aktuelle Performance)
+        since_iso = (datetime.now(timezone.utc)
+                     - timedelta(days=PBT_LOOKBACK_DAYS)).isoformat()
+        rankings = get_all_bot_rankings(min_trades=MIN_TRADES_PBT, since=since_iso)
         if len(rankings) < 2:
             logger.info(f"PBT: zu wenig bewertete Bots ({len(rankings)}), übersprungen")
             return
@@ -114,8 +140,15 @@ def _mutate_config(best_id: int, worst_id: int) -> dict | None:
     new_cfg = deepcopy(worst_cfg)
     delta   = {}
 
+    # K-F-Fix: Score-Schwellen nur kopieren wenn Donor + Empfänger dieselbe Strategie
+    # haben. Sonst bekäme z.B. ein Breakout-Bot (braucht Schwelle 6) die Momentum-
+    # Schwelle 3 → massenhaft Fehlsignale.
+    same_strategy = best_cfg.get("strategy") == worst_cfg.get("strategy")
+
     for key in PBT_MUTABLE_KEYS:
         if key not in best_cfg:
+            continue
+        if key in STRATEGY_SPECIFIC_KEYS and not same_strategy:
             continue
         best_val  = best_cfg[key]
         noise     = MUTATION_RATES.get(key, 0)
@@ -147,8 +180,7 @@ def _mutate_config(best_id: int, worst_id: int) -> dict | None:
     new_cfg["_pbt_inherited_from"] = best_id
     new_cfg["_pbt_timestamp"]      = datetime.now(timezone.utc).isoformat()
 
-    with open(worst_path, "w") as f:
-        json.dump(new_cfg, f, indent=2)
+    _atomic_write_json(worst_path, new_cfg)  # K-G-Fix: atomar
 
     return {"delta": delta, "new_config": new_cfg}
 
@@ -156,20 +188,22 @@ def _mutate_config(best_id: int, worst_id: int) -> dict | None:
 # ──────────────────────────── ML ──────────────────────────── #
 
 async def run_ml_check():
-    """Prüft ob ML-Retrain nötig, triggert wenn ja."""
+    """Prüft ob ML-Retrain nötig, triggert wenn ja (non-blocking via Executor)."""
     try:
         from ml_network import ml_network
-        ml_network.maybe_retrain()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, ml_network.maybe_retrain)
     except Exception as e:
         logger.error(f"ML-Check Fehler: {e}")
 
 
 async def run_ml_full_train():
-    """Vollständiges ML-Training (nightly)."""
+    """Vollständiges ML-Training (nightly, non-blocking via Executor)."""
     logger.info("Nightly ML-Full-Train gestartet")
     try:
         from ml_network import ml_network
-        ml_network.train_all()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, ml_network.train_all)
     except Exception as e:
         logger.error(f"ML-Full-Train Fehler: {e}")
 
@@ -306,7 +340,7 @@ async def _run_data_update():
     logger.info("Nightly Daten-Update gestartet")
     try:
         from data_updater import run_update
-        await asyncio.get_event_loop().run_in_executor(None, run_update)
+        await asyncio.get_running_loop().run_in_executor(None, run_update)
     except Exception as e:
         logger.error(f"Daten-Update Fehler: {e}")
 
@@ -383,8 +417,7 @@ def _load_brain_state() -> dict:
 def _save_task_run(task_name: str):
     state = _load_brain_state()
     state[task_name] = datetime.now(timezone.utc).isoformat()
-    BRAIN_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    BRAIN_STATE_FILE.write_text(json.dumps(state, indent=2))
+    _atomic_write_json(BRAIN_STATE_FILE, state)  # K-G-Fix: atomar
 
 
 def _is_overdue(task_name: str) -> bool:

@@ -92,7 +92,75 @@ def load_csv_klines(path: Path, limit: int = 0) -> List[list]:
     return klines
 
 
-def _score_window(klines_window: list, strategy: str, params: dict) -> Optional[dict]:
+def _compute_regimes_from_15m(klines: list) -> list:
+    """
+    Berechnet 4h-Regime aus 15m-Kerzen (16 × 15m = 1 × 4h-Block).
+    Gibt für jede 15m-Kerze das Regime ihres 4h-Blocks zurück.
+    """
+    import numpy as np
+
+    n = len(klines)
+    regimes = ["ranging"] * n
+    step = 16  # 16 × 15min = 4h
+    num_4h = n // step
+
+    if num_4h < 20:
+        return regimes
+
+    highs  = np.array([max(float(klines[b*step + j][2]) for j in range(step)) for b in range(num_4h)])
+    lows   = np.array([min(float(klines[b*step + j][3]) for j in range(step)) for b in range(num_4h)])
+    closes = np.array([float(klines[(b+1)*step - 1][4]) for b in range(num_4h)])
+
+    m     = len(highs)
+    alpha = 1.0 / 14
+
+    plus_dm  = np.zeros(m)
+    minus_dm = np.zeros(m)
+    tr       = np.zeros(m)
+    for i in range(1, m):
+        up   = highs[i] - highs[i-1]
+        down = lows[i-1] - lows[i]
+        plus_dm[i]  = up   if (up > down   and up > 0)   else 0.0
+        minus_dm[i] = down if (down > up   and down > 0) else 0.0
+        tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+
+    atr_s = np.zeros(m); pdm_s = np.zeros(m); mdm_s = np.zeros(m)
+    atr_s[0] = tr[0]; pdm_s[0] = plus_dm[0]; mdm_s[0] = minus_dm[0]
+    for i in range(1, m):
+        atr_s[i] = atr_s[i-1] * (1 - alpha) + tr[i]       * alpha
+        pdm_s[i] = pdm_s[i-1] * (1 - alpha) + plus_dm[i]  * alpha
+        mdm_s[i] = mdm_s[i-1] * (1 - alpha) + minus_dm[i] * alpha
+
+    # Sichere Nenner: np.where rechnet BEIDE Zweige für alle Elemente, also würde
+    # 100*x/0 an den (frühen) Stellen mit atr_s==0 ein RuntimeWarning werfen, obwohl
+    # das Ergebnis danach zu 0.0 maskiert wird. Mit einem Ersatz-Nenner (1.0) dort,
+    # wo die Bedingung ohnehin False ist, entsteht das x/0 gar nicht erst → kein
+    # Log-Rauschen, identisches Ergebnis.
+    safe_atr    = np.where(atr_s > 0, atr_s, 1.0)
+    plus_di     = np.where(atr_s > 0, 100 * pdm_s / safe_atr, 0.0)
+    minus_di    = np.where(atr_s > 0, 100 * mdm_s / safe_atr, 0.0)
+    di_sum      = plus_di + minus_di
+    safe_di_sum = np.where(di_sum > 0, di_sum, 1.0)
+    dx          = np.where(di_sum > 0, 100 * np.abs(plus_di - minus_di) / safe_di_sum, 0.0)
+
+    adx = np.zeros(m); adx[0] = dx[0]
+    for i in range(1, m):
+        adx[i] = adx[i-1] * (1 - alpha) + dx[i] * alpha
+
+    for b in range(num_4h):
+        if adx[b] > 25:
+            regime = "trending_up" if plus_di[b] > minus_di[b] else "trending_down"
+        else:
+            regime = "ranging"
+        start = b * step
+        for j in range(start, min(start + step, n)):
+            regimes[j] = regime
+
+    return regimes
+
+
+def _score_window(klines_window: list, strategy: str, params: dict,
+                  cached_regime: str = "ranging") -> Optional[dict]:
     """
     Berechnet Score für ein Kerzen-Fenster.
     Läuft im Worker-Prozess.
@@ -107,7 +175,7 @@ def _score_window(klines_window: list, strategy: str, params: dict) -> Optional[
             strategy=strategy,
             min_score_long=params.get("min_score_long", 5),
             min_score_short=-params.get("min_score_long", 5),
-            cached_regime="ranging",
+            cached_regime=cached_regime,
             adx_chop_threshold=params.get("adx_chop_threshold", 18),
         )
         d = result.details or {}
@@ -203,13 +271,16 @@ def _process_symbol_strategy(
     sl_mult    = params.get("atr_sl_multiplier", 1.5)
     tp_mult    = params.get("atr_tp_multiplier", 3.0)
 
+    # Echte 4h-Regime aus 15m-Kerzen berechnen (K2-Fix 2026-06-14)
+    regimes = _compute_regimes_from_15m(klines)
+
     written = 0
     step    = 2  # Alle 2 Kerzen einen Signal-Versuch
 
     for i in range(WINDOW, len(klines) - FUTURE, step):
         window  = klines[i - WINDOW:i]
         future  = klines[i:i + FUTURE]
-        score_r = _score_window(window, strategy, params)
+        score_r = _score_window(window, strategy, params, cached_regime=regimes[i])
 
         if score_r is None or not score_r["signal"]:
             continue

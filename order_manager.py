@@ -71,7 +71,8 @@ def calculate_entry_price(mark_price: float, side: str) -> float:
 async def place_entry_order(symbol: str, side: str, qty: float,
                              entry_price: float, sl_price: float,
                              tp_price: float, score: int,
-                             atr: float, regime: str) -> Optional[dict]:
+                             atr: float, regime: str,
+                             details: dict = None) -> Optional[dict]:
     """
     Platziert eine Limit-Entry-Order und wartet auf Fill (max 30 Minuten).
     
@@ -110,7 +111,7 @@ async def place_entry_order(symbol: str, side: str, qty: float,
         return None
 
     # Fill erhalten – SL und TP setzen
-    await on_fill_event_internal(fill_event, sl_price, tp_price, score, atr, regime)
+    await on_fill_event_internal(fill_event, sl_price, tp_price, score, atr, regime, details)
     return fill_event
 
 
@@ -127,12 +128,15 @@ async def _wait_for_fill(symbol: str, order_id, timeout: int = ENTRY_ORDER_TIMEO
     register_fill_waiter(str(order_id), fill_event, fill_data)
 
     try:
-        deadline = asyncio.get_event_loop().time() + timeout
+        # H2-Fix: get_event_loop() ist in Python 3.10+ deprecated (RuntimeWarning in
+        # 3.14). In einer laufenden Coroutine ist get_running_loop() korrekt.
+        _loop = asyncio.get_running_loop()
+        deadline = _loop.time() + timeout
         poll_interval = 5  # REST-Fallback alle 5 Sekunden
 
-        while asyncio.get_event_loop().time() < deadline:
+        while _loop.time() < deadline:
             # Warte auf WebSocket-Event (max 5s)
-            wait_time = min(poll_interval, deadline - asyncio.get_event_loop().time())
+            wait_time = min(poll_interval, deadline - _loop.time())
             if wait_time <= 0:
                 break
 
@@ -195,7 +199,8 @@ async def on_fill_event(event: dict):
 
 
 async def on_fill_event_internal(fill_data: dict, sl_price: float, tp_price: float,
-                                  score: int, atr: float, regime: str):
+                                  score: int, atr: float, regime: str,
+                                  details: dict = None):
     """
     Verarbeitet einen bestätigten Fill: State aktualisieren, SL/TP setzen.
     """
@@ -221,7 +226,10 @@ async def on_fill_event_internal(fill_data: dict, sl_price: float, tp_price: flo
     )
 
     # Trade in DB loggen
-    log_trade_opened(
+    # S5-4-Fix: trade_id + score am open_position merken, damit log_trade_closed
+    # (position_monitor / websocket_manager) den Trade auch wirklich schließen kann
+    # und network.db den echten Score statt 0 bekommt.
+    db_trade_id = log_trade_opened(
         symbol=symbol,
         side=side,
         entry_price=entry_price,
@@ -232,6 +240,11 @@ async def on_fill_event_internal(fill_data: dict, sl_price: float, tp_price: flo
         score=score,
         opened_at=datetime.now(timezone.utc).isoformat(),
     )
+    state.open_position._db_trade_id = db_trade_id
+    state.open_position._score = score
+    # S5-5-Fix: Marktstruktur-Features für das spätere network.db-Outcome merken,
+    # damit echte Trades nicht mit Default-Features (0.0) ins Win-Training gehen.
+    state.open_position._features = details or {}
 
     # Gegenseite für SL/TP
     close_side = "SELL" if side.upper() == "BUY" else "BUY"
@@ -277,7 +290,10 @@ async def _set_sl_with_retry(symbol: str, side: str, sl_price: float, qty: float
 
     pos = state.open_position
     if pos.symbol and pos.qty:
-        await exchange.emergency_close(pos.symbol, pos.qty, pos.side or "BUY")
+        # S5-2-Fix: `side` ist hier bereits close_side (Gegenseite der Position).
+        # Vorher wurde pos.side (Eröffnungsrichtung) gesendet → in live hätte das die
+        # Position VERDOPPELT statt geschlossen.
+        await exchange.emergency_close(pos.symbol, pos.qty, side)
 
     state.close_position()
 

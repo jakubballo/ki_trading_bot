@@ -28,6 +28,7 @@ class ScoringResult:
     fg_index: float
     details: dict = field(default_factory=dict)
     veto_reason: Optional[str] = None
+    exploration: bool = False    # A1: Veto bewusst überstimmt, um echtes Label zu sammeln
 
 
 def score_candles(
@@ -150,6 +151,9 @@ def score_candles(
         "_weekday_cos":     weekday_cos,
         "_fg_index":        fg_index,
         "_rsi_slope":       rsi_slope,
+        # S5-3-Fix: Strategie in details, damit predict_win_prob (ml_network) live
+        # den echten strategy_enc bekommt statt konstant "momentum" (Train/Live-Mismatch).
+        "_strategy":        strategy,
     }
 
     # ─── Chop-Erkennung (gilt für alle Strategien außer mean_reversion) ───────

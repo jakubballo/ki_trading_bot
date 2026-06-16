@@ -29,6 +29,8 @@ from typing import Optional, Dict, Tuple
 
 import numpy as np
 
+from config import config
+
 logger = logging.getLogger(__name__)
 
 _MODEL_DIR = Path(os.environ.get("ML_MODEL_DIR", "data/ml_models"))
@@ -41,6 +43,8 @@ CLASS_SHORT   = 2
 CLASS_NAMES   = {0: "neutral", 1: "long", 2: "short"}
 
 # 22 Feature-Namen (aus ML_STRATEGIE_DOKU)
+# M1-Fix: fg_index entfernt (war konstant 50.0 im Training, wertlos für Modell A) →
+# 21 Candle-Features. ACHTUNG: Modell A muss neu trainiert werden (Dimension 22→21).
 CANDLE_FEATURES = [
     "rsi_7", "rsi_14", "rsi_21",
     "macd_diff", "macd_signal_line",
@@ -50,13 +54,13 @@ CANDLE_FEATURES = [
     "vol_ratio",
     "ret_1", "ret_4", "ret_8", "ret_16",
     "hour_sin", "hour_cos", "weekday_sin", "weekday_cos",
-    "fg_index",
     "rsi_slope",
 ]
 
 # Features für Win-Modell (aus network.db)
+# fg_index entfernt: in 99.9% der Trainingsdaten konstant 50.0 (Fix 2026-06-14)
 WIN_FEATURES = [
-    "score", "funding_rate", "rsi", "atr", "fg_index",
+    "score", "funding_rate", "rsi", "atr",
     "is_shadow", "is_synthetic", "regime_enc", "strategy_enc",
     # Neue Marktstruktur-Features (Problem 2, ab 2026-06-14)
     "macd_diff", "macd_signal_val",
@@ -90,7 +94,7 @@ XGB_PARAMS = dict(
 # ────────────────────────────── Feature-Extraktion ────────────────────────────
 
 def _candle_features_from_result(sr) -> Optional[np.ndarray]:
-    """Extrahiert 22 Candle-Features aus ScoringResult.details."""
+    """Extrahiert 21 Candle-Features aus ScoringResult.details (M1-Fix: ohne fg_index)."""
     d = sr.details if hasattr(sr, "details") else {}
     try:
         feat = np.array([
@@ -114,7 +118,6 @@ def _candle_features_from_result(sr) -> Optional[np.ndarray]:
             d.get("_hour_cos",        0.0),
             d.get("_weekday_sin",     0.0),
             d.get("_weekday_cos",     0.0),
-            float(getattr(sr, "fg_index", d.get("_fg_index", 50.0))),
             d.get("_rsi_slope",       0.0),
         ], dtype=np.float32)
         if np.any(np.isnan(feat)):
@@ -125,14 +128,32 @@ def _candle_features_from_result(sr) -> Optional[np.ndarray]:
         return None
 
 
+def _recency_factor(closed_at, now: datetime, half_life_days: float) -> float:
+    """
+    B1 — Recency-Gewicht 0.5 ** (Alter / Halbwertszeit). half_life<=0 → 1.0 (aus).
+    Robust gegen fehlende/kaputte Zeitstempel (dann neutral 1.0).
+    """
+    if not half_life_days or half_life_days <= 0 or not closed_at:
+        return 1.0
+    try:
+        ts = datetime.fromisoformat(str(closed_at))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_days = (now - ts).total_seconds() / 86400.0
+        if age_days <= 0:
+            return 1.0
+        return float(0.5 ** (age_days / half_life_days))
+    except Exception:
+        return 1.0
+
+
 def _win_features_from_row(row: dict) -> np.ndarray:
-    """Baut Win-Modell-Feature-Vektor aus network.db-Zeile (22 Features)."""
+    """Baut Win-Modell-Feature-Vektor aus network.db-Zeile (21 Features, ohne fg_index)."""
     return np.array([
         float(row.get("score")           or 0),
         float(row.get("funding_rate")    or 0),
         float(row.get("rsi")             or 50),
         float(row.get("atr")             or 0),
-        float(row.get("fg_index")        or 50),
         float(row.get("is_shadow")       or 0),
         float(row.get("is_synthetic")    or 0),
         float(REGIME_MAP.get(row.get("regime", "ranging"), 2)),
@@ -158,8 +179,8 @@ def _win_features_from_row(row: dict) -> np.ndarray:
 
 def generate_strict_labels(
     klines: list,
-    tp_mult: float = 1.5,
-    sl_mult: float = 1.0,
+    tp_mult: float = 3.0,
+    sl_mult: float = 1.5,
     max_candles: int = 6,
 ) -> np.ndarray:
     """
@@ -236,7 +257,7 @@ class MLNetwork:
         self._win_base:       Optional[object]  = None
 
         self._last_trade_id:  int  = 0
-        self._retrain_threshold    = 50
+        self._retrain_threshold    = config.ml.get("retrain_every_n", 50)
         self._load_models()
 
     # ────────────────── Live-Prediction ──────────────────
@@ -282,7 +303,6 @@ class MLNetwork:
                 float(getattr(scoring_result, "funding_rate", 0)),
                 float(d.get("_rsi_14", d.get("_rsi", 50))),
                 float(getattr(scoring_result, "atr", 0)),
-                float(getattr(scoring_result, "fg_index", 50)),
                 0.0, 0.0,  # is_shadow, is_synthetic immer 0 bei Live-Prediction
                 float(REGIME_MAP.get(getattr(scoring_result, "regime", "ranging"), 2)),
                 float(STRATEGY_MAP.get(d.get("_strategy", "momentum"), 0)),
@@ -373,10 +393,13 @@ class MLNetwork:
     def train_win_models(self):
         """Trainiert Win-Modelle (Modell B) aus network.db."""
         try:
-            from network_db import get_training_data, get_max_trade_id
-            rows = get_training_data(limit=20_000)
-            if len(rows) < 200:
-                logger.info(f"Win-Training: zu wenig Daten ({len(rows)} < 200)")
+            from network_db import get_training_data_balanced, get_max_trade_id
+            # B2: pro Symbol gleich viele Zeilen statt globalem LIMIT
+            rows = get_training_data_balanced(
+                per_symbol=config.ml.get("samples_per_symbol", 8000))
+            min_base = config.ml.get("min_samples_base", 200)
+            if len(rows) < min_base:
+                logger.info(f"Win-Training: zu wenig Daten ({len(rows)} < {min_base})")
                 return
 
             logger.info(f"Win-Training gestartet: {len(rows)} Trades")
@@ -391,7 +414,7 @@ class MLNetwork:
                 by_sym[r["symbol"]].append(r)
 
             for sym, sym_rows in by_sym.items():
-                if len(sym_rows) >= 150:
+                if len(sym_rows) >= config.ml.get("min_samples_symbol", 150):
                     m = self._train_win_model(sym_rows)
                     self._win_models[sym] = m
                     self._save_model(m, f"win_{sym}")
@@ -473,15 +496,23 @@ class MLNetwork:
     def _train_win_model(self, rows: list):
         """Binärer XGBoost: P(win) aus network.db."""
         import xgboost as xgb
-        from config import config as cfg
+
+        half_life = config.ml.get("weight_half_life_days", 0)
+        now = datetime.now(timezone.utc)
 
         X, y, w = [], [], []
         for r in rows:
             pnl = r.get("pnl")
             if pnl is None:
                 continue
+            # S5-7-Fix: dedup_replaced/orphaned sind keine echten Outcomes (pnl=0.0
+            # bzw. künstlich) → würden als Verlust-Label das Win-Modell verzerren.
+            if r.get("exit_reason") in ("dedup_replaced", "orphaned"):
+                continue
             label  = 1 if float(pnl) > 0 else 0
             weight = float(r.get("weight") or 1.0)
+            # B1 — Recency-Decay: ältere Outcomes zählen weniger (Halbwertszeit).
+            weight *= _recency_factor(r.get("closed_at"), now, half_life)
             feat   = _win_features_from_row(r)
             X.append(feat); y.append(label); w.append(weight)
 
@@ -497,8 +528,16 @@ class MLNetwork:
         y_tr, y_val = y[:split], y[split:]
         w_tr        = w[:split]
 
+        # B4 — Class-Imbalance: Verlust dominiert (~64/36) → ohne Korrektur drückt
+        # das Modell P(win) systematisch nach unten. scale_pos_weight = #neg/#pos
+        # auf dem Trainings-Split balanciert die Klassen-Gradienten.
+        n_pos = int((y_tr == 1).sum())
+        n_neg = int((y_tr == 0).sum())
+        spw = (n_neg / n_pos) if n_pos > 0 else 1.0
+
         params = {**XGB_PARAMS, "objective": "binary:logistic",
-                  "eval_metric": "logloss", "num_class": None}
+                  "eval_metric": "logloss", "num_class": None,
+                  "scale_pos_weight": spw}
         params.pop("num_class", None)
         model = xgb.XGBClassifier(**params)
         model.fit(X_tr, y_tr, sample_weight=w_tr,
@@ -665,8 +704,8 @@ def _compute_candle_features_batch(klines: list) -> np.ndarray:
     except Exception:
         hour_sin = hour_cos = weekday_sin = weekday_cos = pd.Series(0.0, index=df.index)
 
-    fg = pd.Series(50.0, index=df.index)  # F&G nicht in CSV → Platzhalter
-
+    # M1-Fix: fg_index entfernt (konstant 50.0 → wertlos). Reihenfolge muss exakt
+    # CANDLE_FEATURES entsprechen → rsi_slope bleibt letztes Feature.
     feat = np.column_stack([
         rsi7.values, rsi14.values, rsi21.values,
         (macd - sig).values, sig.values,
@@ -678,7 +717,7 @@ def _compute_candle_features_batch(klines: list) -> np.ndarray:
         ret1.values, ret4.values, ret8.values, ret16.values,
         np.array(hour_sin), np.array(hour_cos),
         np.array(weekday_sin), np.array(weekday_cos),
-        fg.values, rsi_slope.values,
+        rsi_slope.values,
     ]).astype(np.float32)
 
     return feat

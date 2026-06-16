@@ -92,6 +92,15 @@ from logger_db import log_signal
 
 _kill_switch_active = False
 
+# H1-Fix: Doppel-Scoring verhindern. Sowohl der WS-Kerzenschluss-Callback als auch
+# der _scoring_timer-Fallback können trigger_scoring_cycle für dasselbe Symbol fast
+# gleichzeitig aufrufen → doppelte Trades/Shadows. Guard + 60s-Debounce pro Symbol.
+# (Single-Prozess + asyncio single-threaded → set/dict ohne Lock sicher, da zwischen
+#  Prüfung und Eintrag kein await liegt.)
+_scoring_in_progress: set = set()
+_last_scoring_ts: dict = {}
+_SCORING_DEBOUNCE_SECS = 60
+
 
 # ─── STARTUP ──────────────────────────────────────────────────────────────────
 
@@ -182,6 +191,18 @@ async def trigger_scoring_cycle(symbol: str, kline_data: dict = None):
     if _kill_switch_active:
         return
 
+    # H1-Fix: Doppel-Scoring (Timer + WS-Event gleichzeitig) verhindern.
+    import time as _time_module
+    now_ts = _time_module.time()
+    if symbol in _scoring_in_progress:
+        logger.debug(f"Scoring für {symbol} läuft bereits – übersprungen")
+        return
+    if now_ts - _last_scoring_ts.get(symbol, 0.0) < _SCORING_DEBOUNCE_SECS:
+        logger.debug(f"Scoring für {symbol} kürzlich gelaufen – Debounce")
+        return
+    _scoring_in_progress.add(symbol)
+    _last_scoring_ts[symbol] = now_ts
+
     try:
         logger.info(f"Scoring-Zyklus: {symbol}")
 
@@ -191,9 +212,11 @@ async def trigger_scoring_cycle(symbol: str, kline_data: dict = None):
             return
 
         ticker        = await exchange.get_ticker(symbol)
-        funding_raw   = float(ticker.get("fundingRate", 0) or 0)
         mark_price    = float(ticker.get("markPrice", ticker.get("last", 0)) or 0)
-        funding_rate  = funding_raw / mark_price if mark_price > 0 else 0.0
+        # S6-2: Funding IMMER vom Live-Endpoint (Demo-Ticker liefert ein Artefakt,
+        # z.B. ETH/SOL/XRP dauerhaft ~−0.25 %). get_funding_rate() zieht den echten
+        # Live-Wert und normalisiert mit Live-markPrice. OI/vwap/Preise bleiben Demo.
+        funding_rate  = await exchange.get_funding_rate(symbol)
         open_interest = float(ticker.get("openInterest", 0) or 0)
         vwap24h       = float(ticker.get("vwap24h", 0) or 0)
         high24h       = float(ticker.get("high24h", mark_price) or mark_price)
@@ -328,8 +351,14 @@ async def trigger_scoring_cycle(symbol: str, kline_data: dict = None):
             return
 
         # ─── Trade eröffnen ───────────────────────────────────────────────────
+        # K-B-Fix: ATR==0 → sl_price == tp_price == entry_price → sofortiger Fill/Verlust.
+        # Ungültige ATR niemals zu einem Trade führen lassen.
+        if not result.atr or result.atr <= 0:
+            logger.warning(f"ATR ungültig ({result.atr}) für {symbol} – Trade abgebrochen")
+            return
+
         sl_mult = config.risk.get("sl_atr_multiplier", 1.5)
-        tp_mult = config.risk.get("tp_atr_multiplier", 2.0)
+        tp_mult = config.risk.get("tp_atr_multiplier", 3.0)
         entry_price = calculate_entry_price(mark_price, order_side)
 
         if order_side == "BUY":
@@ -355,12 +384,15 @@ async def trigger_scoring_cycle(symbol: str, kline_data: dict = None):
             symbol=symbol, side=order_side, qty=calculated_qty,
             entry_price=entry_price, sl_price=sl_price, tp_price=tp_price,
             score=result.score, atr=result.atr, regime=result.regime,
+            details=result.details,
         )
 
     except Exception as e:
         logger.error(f"Fehler im Scoring-Zyklus {symbol}: {e}")
         log_error("main", type(e).__name__, str(e), traceback.format_exc())
     finally:
+        # H1-Fix: Scoring-Guard für dieses Symbol freigeben
+        _scoring_in_progress.discard(symbol)
         # Gesamten Session-Log als Textdatei sichern (bei jedem Scoring überschrieben)
         write_scoring_snapshot()
 
@@ -388,9 +420,9 @@ def _register_shadow_trade(symbol, side, mark_price, result, reject_reason,
             sl_price=mark_price - result.atr * config.risk.get("sl_atr_multiplier", 1.5)
                      if side == "BUY"
                      else mark_price + result.atr * config.risk.get("sl_atr_multiplier", 1.5),
-            tp_price=mark_price + result.atr * config.risk.get("tp_atr_multiplier", 2.0)
+            tp_price=mark_price + result.atr * config.risk.get("tp_atr_multiplier", 3.0)
                      if side == "BUY"
-                     else mark_price - result.atr * config.risk.get("tp_atr_multiplier", 2.0),
+                     else mark_price - result.atr * config.risk.get("tp_atr_multiplier", 3.0),
             score=result.score,
             regime=result.regime,
             block_reason=reject_reason,
@@ -417,13 +449,13 @@ def _register_veto_shadow(symbol, side, mark_price, result, veto_reason,
             sl_price=mark_price - result.atr * config.risk.get("sl_atr_multiplier", 1.5)
                      if side == "BUY"
                      else mark_price + result.atr * config.risk.get("sl_atr_multiplier", 1.5),
-            tp_price=mark_price + result.atr * config.risk.get("tp_atr_multiplier", 2.0)
+            tp_price=mark_price + result.atr * config.risk.get("tp_atr_multiplier", 3.0)
                      if side == "BUY"
-                     else mark_price - result.atr * config.risk.get("tp_atr_multiplier", 2.0),
+                     else mark_price - result.atr * config.risk.get("tp_atr_multiplier", 3.0),
             score=result.score,
             regime=result.regime,
             block_reason=veto_reason,
-            is_veto=True,
+            is_veto=not veto_reason.startswith("regime_gate"),
             funding_rate=funding_rate,
             fg_index=fg_index,
             rsi=result.details.get("_rsi", 50.0),

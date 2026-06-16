@@ -150,15 +150,33 @@ def _is_vetoed(r, regime, strategy, model_a, model_b):
                     return True
             except Exception:
                 pass
-    # Stufe B
+    # Stufe B – S5-9-Fix: 21-Feature-Vektor identisch zu ml_network.predict_win_prob.
+    # Vorher nur 9 Features → Shape-Mismatch gegen das 21-dim Modell → vom except
+    # verschluckt → Modell B vetoed im Test NIE → Walk-Forward zeigte nur Modell A.
     if model_b is not None:
+        d = r.details or {}
         try:
             feat_b = np.array([[
-                float(r.score), 0.0,
-                float(r.details.get("_rsi_14", r.details.get("_rsi", 50))),
-                float(r.atr), 50.0, 0.0, 0.0,
+                float(r.score),
+                float(getattr(r, "funding_rate", 0.0)),
+                float(d.get("_rsi_14", d.get("_rsi", 50))),
+                float(r.atr),
+                0.0, 0.0,  # is_shadow, is_synthetic
                 float(REGIME_MAP.get(regime, 2)),
                 float(STRATEGY_MAP.get(strategy, 0)),
+                float(d.get("_macd_diff",       0)),
+                float(d.get("_macd_signal",     0)),
+                float(d.get("_ema_ratio_9_21",  0)),
+                float(d.get("_ema_ratio_21_50", 0)),
+                float(d.get("_price_vs_ema50",  0)),
+                float(d.get("_bb_pct",          0.5)),
+                float(d.get("_bb_width",        0)),
+                float(d.get("_vol_ratio",       1.0)),
+                float(d.get("_rsi_slope",       0)),
+                float(d.get("_ret_1",           0)),
+                float(d.get("_ret_4",           0)),
+                float(d.get("_ret_8",           0)),
+                float(d.get("_ret_16",          0)),
             ]], dtype=np.float32)
             p = float(model_b.predict_proba(feat_b)[0][1])
             if p < VETO_THRESHOLD:
@@ -192,10 +210,25 @@ def process_symbol(symbol, klines):
     # --- Modell B aus ECHTEN Trainings-Signal-Outcomes ---
     train_sig = _gen_signals(symbol, klines, regimes, WINDOW, split)
     rows = [{
-        "score": r.score, "funding_rate": 0.0,
+        "score": r.score, "funding_rate": float(getattr(r, "funding_rate", 0.0)),
         "rsi": r.details.get("_rsi", 50.0), "atr": r.atr, "fg_index": 50.0,
         "is_shadow": 0, "is_synthetic": 0, "regime": reg, "strategy": strat,
         "pnl": pnl, "weight": 1.0,
+        # S5-9-Fix: 13 Marktstruktur-Features mittrainieren, damit Modell B hier
+        # exakt dieselben 21 Features lernt wie live (sonst inerte Default-Features).
+        "macd_diff":       r.details.get("_macd_diff",       0.0),
+        "macd_signal_val": r.details.get("_macd_signal",     0.0),
+        "ema_ratio_9_21":  r.details.get("_ema_ratio_9_21",  0.0),
+        "ema_ratio_21_50": r.details.get("_ema_ratio_21_50", 0.0),
+        "price_vs_ema50":  r.details.get("_price_vs_ema50",  0.0),
+        "bb_pct":          r.details.get("_bb_pct",          0.5),
+        "bb_width":        r.details.get("_bb_width",        0.0),
+        "vol_ratio":       r.details.get("_vol_ratio",       1.0),
+        "rsi_slope":       r.details.get("_rsi_slope",       0.0),
+        "ret_1":           r.details.get("_ret_1",           0.0),
+        "ret_4":           r.details.get("_ret_4",           0.0),
+        "ret_8":           r.details.get("_ret_8",           0.0),
+        "ret_16":          r.details.get("_ret_16",          0.0),
     } for (r, reg, strat, pnl) in train_sig]
     model_b = None
     try:

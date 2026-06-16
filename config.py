@@ -65,12 +65,24 @@ DEFAULT_CONFIG = {
 
     "ml": {
         "veto_threshold": 0.42,       # P(win) < Schwelle → Signal verworfen
-        "min_samples_symbol": 50,     # Min Samples für Symbol-Modell
-        "min_samples_base": 20,       # Min Samples für Basis-Modell
+        "min_samples_symbol": 150,    # Min Samples für Symbol-Modell (Session-2-Fix)
+        "min_samples_base": 200,      # Min Samples für Basis-Modell (Session-2-Fix)
         "retrain_every_n": 50,        # Retrain alle N neuen Outcomes
         "weight_real": 1.0,
         "weight_shadow": 0.5,
         "weight_synthetic": 0.2,
+        # B1 — Recency-Gewichtung: ältere Outcomes zählen weniger.
+        # Halbwertszeit in Tagen; 0 oder negativ = deaktiviert (kein Decay).
+        "weight_half_life_days": 45,
+        # B2 — Symbol-balanciertes Sampling: max. Zeilen pro Symbol fürs Win-Training.
+        # Verhindert Symbol-Schieflage des alten globalen LIMIT 20000.
+        "samples_per_symbol": 8000,
+        # A1 — Exploration: ein kleiner Teil knapp-vetoeter High-Score-Signale wird
+        # trotzdem (Paper-)gehandelt, um echte Labels in der Veto-Grauzone zu sammeln.
+        "exploration_enabled": True,
+        "exploration_rate": 0.10,     # Wahrscheinlichkeit, ein Grauzonen-Veto zu überstimmen
+        "exploration_band": 0.10,     # nur wenn P(win) >= veto_threshold - band ("knapp daneben")
+        "exploration_min_score": 0,   # nur Signale mit |score| >= diesem Wert (0 = aus)
     },
 
     "pbt_mutable": False,             # Darf der PBT-Selektor diese Config ändern?

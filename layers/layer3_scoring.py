@@ -4,6 +4,7 @@ Holt gecachtes Regime und delegiert an scoring_core.score_candles().
 """
 
 import logging
+import random
 from typing import Optional
 
 from config import config
@@ -63,6 +64,24 @@ def calculate_layer3_score(
     return result
 
 
+def _exploration_override(result: ScoringResult, prob: float, threshold: float) -> bool:
+    """
+    A1 — Entscheidet, ob ein durch Modell B vetoetes Signal als Exploration
+    trotzdem gehandelt wird. Nur "knapp daneben" + optional starker Score, dann
+    mit Wahrscheinlichkeit exploration_rate. Im Paper-Modus risikolos, liefert
+    aber echte 1.0-Labels in genau der Grauzone, die das Veto sonst nie sieht.
+    """
+    if not config.ml.get("exploration_enabled", False):
+        return False
+    band = config.ml.get("exploration_band", 0.10)
+    if prob < threshold - band:        # zu schlecht → kein Exploration, echtes Veto
+        return False
+    min_score = config.ml.get("exploration_min_score", 0)
+    if min_score and abs(result.score) < min_score:
+        return False
+    return random.random() < config.ml.get("exploration_rate", 0.10)
+
+
 def _apply_ml_veto(result: ScoringResult, symbol: str) -> ScoringResult:
     """
     Zweistufiges ML-Veto:
@@ -94,12 +113,23 @@ def _apply_ml_veto(result: ScoringResult, symbol: str) -> ScoringResult:
         prob = ml_network.predict_win_prob(symbol, result)
         threshold = config.ml.get("veto_threshold", 0.42)
         if prob is not None and prob < threshold:
-            logger.info(f"ML-Veto B: {symbol} P(win)={prob:.3f} < {threshold}")
-            result.signal = False
-            result.veto_reason = f"ml_win(p={prob:.3f})"
+            # A1 — Exploration: knapp-vetoete High-Score-Signale gelegentlich
+            # trotzdem handeln, um echte Labels in der Grauzone zu sammeln.
+            if _exploration_override(result, prob, threshold):
+                result.exploration = True
+                result.details["_exploration"] = 1.0
+                logger.info(f"ML-Veto B: {symbol} P(win)={prob:.3f} < {threshold} "
+                            f"→ EXPLORATION (Veto überstimmt)")
+            else:
+                logger.info(f"ML-Veto B: {symbol} P(win)={prob:.3f} < {threshold}")
+                result.signal = False
+                result.veto_reason = f"ml_win(p={prob:.3f})"
 
-    except Exception:
-        pass  # ML nicht verfügbar → kein Veto
+    except Exception as e:
+        # K-H-Fix: Exception NICHT still verschlucken. Bei Feature-Dimension-Mismatch
+        # nach einem Retrain (z.B. altes Modell mit 22 Features) wären sonst ALLE
+        # ML-Vetos lautlos deaktiviert – Trades gingen ungefiltert durch.
+        logger.warning(f"ML-Veto Exception ({symbol}): {type(e).__name__}: {e}")
     return result
 
 

@@ -38,6 +38,95 @@ def update_mark_price(price: float):
     _mark_price = price
 
 
+def _log_closed_position(pos, exit_price: float, exit_reason: str):
+    """
+    K-C-Fix: Schreibt das Outcome eines Nicht-SL/TP-Exits (Timeout, Liquidation)
+    in network.db (ML-Training) UND logger_db (Pro-Bot-Statistik) – VOR close_position().
+    Ohne diesen Aufruf verschwanden Timeout-/Emergency-Closes komplett aus dem Lernsystem
+    und blieben als "offen" in der DB stehen.
+    """
+    try:
+        qty = pos.qty or 0
+        entry = pos.entry_price or exit_price
+        is_long = pos.side == "BUY"
+        if is_long:
+            pnl_raw = qty * (exit_price - entry)
+        else:
+            pnl_raw = qty * (entry - exit_price)
+        fee_rate = (config.risk.get("fee_taker", 0.0005)
+                    + config.risk.get("fee_slippage", 0.0002))
+        fees = qty * exit_price * fee_rate * 2
+        pnl_net = pnl_raw - fees
+        pnl_pct = pnl_net / (qty * entry) if qty * entry > 0 else 0.0
+
+        # Tages-/Wochen-PnL aktualisieren (für Tagesverlust-Limit)
+        state.update_daily_pnl(pnl_net)
+        state.update_weekly_pnl(pnl_net)
+
+        # Pro-Bot-DB
+        try:
+            from logger_db import log_trade_closed
+            trade_id = getattr(state.open_position, "_db_trade_id", -1)
+            if trade_id > 0:
+                entry_time = datetime.fromisoformat(
+                    pos.entry_time_utc.replace("Z", "+00:00")) if pos.entry_time_utc else None
+                hold_hours = ((datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
+                              if entry_time else 0.0)
+                log_trade_closed(
+                    trade_id=trade_id,
+                    exit_price=exit_price,
+                    pnl_usdt=pnl_net,
+                    pnl_pct=pnl_pct * 100,
+                    fees_usdt=fees,
+                    funding_paid_usdt=0.0,
+                    hold_duration_hours=hold_hours,
+                    exit_reason=exit_reason,
+                )
+        except Exception as e:
+            logger.error(f"log_trade_closed fehlgeschlagen: {e}")
+
+        # Netzwerk-DB (ML-Training)
+        # S5-5-Fix: Marktstruktur-Features aus dem bei Entry gemerkten Scoring mitgeben.
+        try:
+            from network_db import log_network_trade
+            f = getattr(state.open_position, "_features", {}) or {}
+            log_network_trade(
+                bot_id=config.bot_id,
+                symbol=pos.symbol,
+                side=pos.side,
+                entry=entry,
+                exit_price=exit_price,
+                pnl=pnl_net,
+                exit_reason=exit_reason,
+                score=getattr(state.open_position, "_score", 0),
+                regime=getattr(pos, "regime_at_entry", None) or "unknown",
+                rsi=f.get("_rsi", 50.0),
+                atr=getattr(pos, "atr_at_entry", 0.0) or 0.0,
+                fg_index=f.get("_fg_index", 50.0),
+                strategy=config.strategy,
+                is_shadow=False,
+                macd_diff=f.get("_macd_diff", 0.0),
+                macd_signal_val=f.get("_macd_signal", 0.0),
+                ema_ratio_9_21=f.get("_ema_ratio_9_21", 0.0),
+                ema_ratio_21_50=f.get("_ema_ratio_21_50", 0.0),
+                price_vs_ema50=f.get("_price_vs_ema50", 0.0),
+                bb_pct=f.get("_bb_pct", 0.5),
+                bb_width=f.get("_bb_width", 0.0),
+                vol_ratio=f.get("_vol_ratio", 1.0),
+                rsi_slope=f.get("_rsi_slope", 0.0),
+                ret_1=f.get("_ret_1", 0.0),
+                ret_4=f.get("_ret_4", 0.0),
+                ret_8=f.get("_ret_8", 0.0),
+                ret_16=f.get("_ret_16", 0.0),
+                opened_at=getattr(pos, "entry_time_utc", None),  # S6-1: echte Open-Zeit
+            )
+        except Exception as e:
+            logger.error(f"log_network_trade fehlgeschlagen: {e}")
+
+    except Exception as e:
+        logger.error(f"_log_closed_position Fehler: {e}")
+
+
 async def run_position_monitor():
     """
     Haupt-Monitoring-Task. Läuft alle 30 Sekunden und prüft:
@@ -139,6 +228,8 @@ async def _check_liquidation_risk(pos):
 
             close_side = "SELL" if pos.side == "BUY" else "BUY"
             await exchange.emergency_close(pos.symbol, pos.qty or 0, close_side)
+            # K-C-Fix: Outcome loggen BEVOR die Position aus dem State entfernt wird
+            _log_closed_position(pos, exit_price=mark_price, exit_reason="liquidation")
             state.close_position()
 
         elif distance < 0.10:
@@ -182,6 +273,10 @@ async def _check_max_hold_duration(pos):
             await exchange.cancel_all_orders(pos.symbol)
             close_side = "SELL" if pos.side == "BUY" else "BUY"
             await exchange.place_market_order(pos.symbol, close_side, pos.qty or 0)
+            # K-C-Fix: Outcome loggen BEVOR die Position aus dem State entfernt wird
+            exit_mark = _mark_price or await exchange.get_mark_price(pos.symbol)
+            _log_closed_position(pos, exit_price=exit_mark or (pos.entry_price or 0),
+                                 exit_reason="timeout")
             state.close_position()
 
     except Exception as e:

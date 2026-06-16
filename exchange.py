@@ -111,10 +111,15 @@ class ExchangeClient:
         return BASE_URL_DEMO if self.is_paper else BASE_URL_LIVE
 
     async def _request(self, method: str, endpoint: str,
-                       params: dict = None, signed: bool = False) -> Any:
-        """REST-Request mit Retry und Kraken-Signing."""
+                       params: dict = None, signed: bool = False,
+                       base_url: str = None) -> Any:
+        """REST-Request mit Retry und Kraken-Signing.
+
+        base_url überschreibt optional die modusabhängige Standard-URL — genutzt
+        z.B. für öffentliche Live-Marktdaten (Funding) auch im paper-Modus (S6-2).
+        """
         session = await self._get_session()
-        url = f"{self._base_url()}{endpoint}"
+        url = f"{(base_url or self._base_url())}{endpoint}"
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         backoff = [1, 2, 4, 8, 16, 32, 60]
 
@@ -225,10 +230,19 @@ class ExchangeClient:
         """
         Gibt die relative Funding-Rate zurück.
         Kraken liefert fundingRate absolut in USD → teile durch markPrice.
+
+        S6-2: Funding kommt IMMER vom Live-Public-Endpoint (futures.kraken.com,
+        keine Auth nötig — wie CHARTS_URL). Im paper-Modus liefert der Demo-WS
+        ein Artefakt (z.B. ETH/SOL/XRP dauerhaft ~−0.25 %), das 4/5 Symbole
+        fälschlich funding-blockt. Echte Live-Werte wahren die Live-Treue, da
+        sie gegen dasselbe Limit geprüft werden. Preise/Fills bleiben unberührt.
         """
         try:
-            ticker = await self.get_ticker(symbol)
-            funding_abs = float(ticker.get("fundingRate", 0))
+            data = await self._request("GET", "/derivatives/api/v3/tickers",
+                                       base_url=BASE_URL_LIVE)
+            tickers = {t["symbol"]: t for t in data.get("tickers", [])}
+            ticker = tickers.get(symbol, {})
+            funding_abs = float(ticker.get("fundingRate", 0) or 0)
             mark_price  = float(ticker.get("markPrice", ticker.get("last", 1)) or 1)
             return funding_abs / mark_price if mark_price > 0 else 0.0
         except Exception as e:
@@ -353,8 +367,11 @@ class ExchangeClient:
                 inst = instruments.get(symbol, {})
                 fallback = defaults.get(symbol, {"step_size": 0.01, "min_qty": 0.01,
                                                   "tick_size": 0.01, "min_notional": 1.0})
+                # contractSize von Kraken ist in USD-Kontrakt-Einheiten (z.B. 1 USD/Kontrakt
+                # für PF_XBTUSD), nicht in der Basiswährung (BTC). Die Sizing-Formel rechnet
+                # aber in Basiswährung → immer Fallback-step_size nutzen.
                 _symbol_filters[symbol] = {
-                    "step_size":    float(inst.get("contractSize", fallback["step_size"])),
+                    "step_size":    fallback["step_size"],
                     "min_qty":      fallback["min_qty"],
                     "max_qty":      float(inst.get("maxPositionSize", 1_000_000)),
                     "tick_size":    float(inst.get("tickSize", fallback["tick_size"])),
@@ -647,6 +664,20 @@ class ExchangeClient:
         order["status"] = "FILLED"
         logger.info(f"[PAPER-FILL] {order['side']} {order.get('qty', '?')} "
                     f"{order['symbol']} @ {fill_price:.4f}")
+
+        # K-I-Fix: Paper-Position direkt beim Entry-Fill setzen, damit
+        # _paper_get_position_qty() (von place_stop_market/place_take_profit_market
+        # genutzt) eine korrekte Menge liefert statt 0.0. Vorher wurde _paper_position
+        # nur extern aus websocket_manager gesetzt → SL/TP-Orders mit qty=0 möglich.
+        qty = float(order.get("qty", 0) or 0)
+        sign = 1 if order.get("side") == "BUY" else -1
+        self._paper_position = {
+            "symbol": order["symbol"],
+            "positionAmt": qty * sign,
+            "entryPrice": fill_price,
+            "side": order.get("side"),
+        }
+
         return {
             "symbol": order["symbol"],
             "side": order["side"],

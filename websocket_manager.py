@@ -41,6 +41,13 @@ _fill_waiters: Dict[str, tuple] = {}
 # Letzter bekannter Mark-Preis pro Symbol
 _mark_prices: Dict[str, float] = {}
 
+# Letzter gesehener Kerzen-Zeitstempel pro Symbol (Kerzenschluss-Erkennung).
+# Kraken sendet pro Tick ein candles_15-Update mit gefülltem "close" → "close is not None"
+# wäre IMMER True. Eine Kerze gilt erst als geschlossen, wenn eine Kerze mit NEUEM
+# "time" (= nächstes Intervall beginnt) eintrifft.
+_last_candle_ts_15: Dict[str, int] = {}
+_last_candle_ts_240: Dict[str, int] = {}
+
 _market_task: Optional[asyncio.Task] = None
 _paper_monitor_task: Optional[asyncio.Task] = None
 
@@ -100,7 +107,7 @@ async def _run_market_stream():
     Der Hub leitet rohe Kraken-Nachrichten 1:1 weiter → kein Abonnement nötig.
     """
     delay_index = 0
-    kraken_url = WS_URL_DEMO if config.is_paper else WS_URL_LIVE
+    kraken_url = WS_URL_LIVE  # S6-4: Marktdaten-WS immer live (auch paper), Demo war instabil
     use_hub = True  # Starte mit Hub-Verbindung
 
     while True:
@@ -163,17 +170,17 @@ async def _subscribe(ws):
         "product_ids": product_ids,
     }))
 
-    # 15-Minuten-Kerzen
+    # 15-Minuten-Kerzen (S6-4: Live-Feed-Name)
     await ws.send(json.dumps({
         "event": "subscribe",
-        "feed": "candles_15",
+        "feed": "candles_trade_15m",
         "product_ids": product_ids,
     }))
 
-    # 240-Minuten-Kerzen (4h) – Demo liefert diese oft nicht
+    # 240-Minuten-Kerzen (4h) (S6-4: Live-Feed-Name)
     await ws.send(json.dumps({
         "event": "subscribe",
-        "feed": "candles_240",
+        "feed": "candles_trade_4h",
         "product_ids": product_ids,
     }))
 
@@ -209,22 +216,40 @@ async def _process_message(msg: dict):
                 except Exception:
                     pass
 
-    # 15-Minuten-Kerze geschlossen
-    elif feed.startswith("candles_15") and "candle" in msg:
+    # 15-Minuten-Kerze geschlossen (S6-4: Live-Feed `candles_trade_15m`, deckt auch
+    # `candles_trade_15m_snapshot` per startswith ab; Demo war `candles_15`)
+    elif feed.startswith("candles_trade_15m") and "candle" in msg:
         candle = msg["candle"]
         symbol = msg.get("product_id")
-        is_closed = candle.get("close") is not None
-        if is_closed and symbol and _on_kline_15m_closed:
-            logger.info(f"15m Kerze geschlossen: {symbol}")
-            asyncio.create_task(_on_kline_15m_closed(symbol, candle))
+        candle_ts = candle.get("time")
+        # S6-5: nur das/die EIGENE(n) Symbol(e) scoren. Der Hub broadcastet alle 5
+        # Symbole; der Live-WS liefert (anders als der Demo-WS) tatsächlich Candle-
+        # Close-Events für alle → ohne Filter scort jeder Bot Fremdsymbole
+        # ("Symbol-Filter fehlt"). Ticker-Handler filtert ebenso via config.symbols.
+        if symbol in config.symbols and candle_ts is not None and _on_kline_15m_closed:
+            last_ts = _last_candle_ts_15.get(symbol)
+            if last_ts is None:
+                # Erste gesehene Kerze: nur merken (Kerze läuft noch, kein Schluss).
+                _last_candle_ts_15[symbol] = candle_ts
+            elif candle_ts > last_ts:
+                # Neues Intervall begonnen → vorherige Kerze ist geschlossen → Scoring.
+                _last_candle_ts_15[symbol] = candle_ts
+                logger.info(f"15m Kerze geschlossen: {symbol}")
+                asyncio.create_task(_on_kline_15m_closed(symbol, candle))
 
-    # 4h-Kerze geschlossen
-    elif feed.startswith("candles_240") and "candle" in msg:
+    # 4h-Kerze geschlossen (S6-4: Live-Feed `candles_trade_4h`; Demo war `candles_240`)
+    elif feed.startswith("candles_trade_4h") and "candle" in msg:
         candle = msg["candle"]
         symbol = msg.get("product_id")
-        if symbol and _on_kline_4h_closed:
-            logger.info(f"4h Kerze geschlossen: {symbol}")
-            asyncio.create_task(_on_kline_4h_closed(symbol, candle))
+        candle_ts = candle.get("time")
+        if symbol in config.symbols and candle_ts is not None and _on_kline_4h_closed:  # S6-5
+            last_ts = _last_candle_ts_240.get(symbol)
+            if last_ts is None:
+                _last_candle_ts_240[symbol] = candle_ts
+            elif candle_ts > last_ts:
+                _last_candle_ts_240[symbol] = candle_ts
+                logger.info(f"4h Kerze geschlossen: {symbol}")
+                asyncio.create_task(_on_kline_4h_closed(symbol, candle))
 
 
 async def _health_check(ws):
@@ -373,8 +398,10 @@ async def _check_sl_tp_fills(pos, symbol: str, mark_price: float):
             )
 
         # Trade in network.db schreiben
+        # S5-5-Fix: Marktstruktur-Features aus dem bei Entry gemerkten Scoring mitgeben.
         try:
             from network_db import log_network_trade
+            f = getattr(state.open_position, "_features", {}) or {}
             log_network_trade(
                 bot_id=config.bot_id,
                 symbol=symbol,
@@ -385,7 +412,26 @@ async def _check_sl_tp_fills(pos, symbol: str, mark_price: float):
                 exit_reason=exit_reason,
                 score=getattr(state.open_position, "_score", 0),
                 regime=pos.regime_at_entry or "unknown",
+                rsi=f.get("_rsi", 50.0),
+                atr=getattr(pos, "atr_at_entry", 0.0) or 0.0,
+                funding_rate=f.get("_funding_rate", 0.0),
+                fg_index=f.get("_fg_index", 50.0),
+                strategy=config.strategy,
                 is_shadow=False,
+                macd_diff=f.get("_macd_diff", 0.0),
+                macd_signal_val=f.get("_macd_signal", 0.0),
+                ema_ratio_9_21=f.get("_ema_ratio_9_21", 0.0),
+                ema_ratio_21_50=f.get("_ema_ratio_21_50", 0.0),
+                price_vs_ema50=f.get("_price_vs_ema50", 0.0),
+                bb_pct=f.get("_bb_pct", 0.5),
+                bb_width=f.get("_bb_width", 0.0),
+                vol_ratio=f.get("_vol_ratio", 1.0),
+                rsi_slope=f.get("_rsi_slope", 0.0),
+                ret_1=f.get("_ret_1", 0.0),
+                ret_4=f.get("_ret_4", 0.0),
+                ret_8=f.get("_ret_8", 0.0),
+                ret_16=f.get("_ret_16", 0.0),
+                opened_at=getattr(pos, "entry_time_utc", None),  # S6-1: echte Open-Zeit
             )
         except Exception:
             pass

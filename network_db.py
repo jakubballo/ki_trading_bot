@@ -156,6 +156,7 @@ def log_network_trade(
     ret_4: float = 0.0,
     ret_8: float = 0.0,
     ret_16: float = 0.0,
+    opened_at: Optional[str] = None,
 ) -> int:
     """Schreibt einen Trade (real/shadow/synthetic) in die zentrale DB."""
     from config import config as cfg
@@ -181,7 +182,9 @@ def log_network_trade(
             score, regime, funding_rate, rsi, atr, fg_index, strategy,
             int(is_shadow), int(is_synthetic), block_reason, int(is_veto),
             json.dumps(config_snapshot) if config_snapshot else None,
-            datetime.now(timezone.utc).isoformat(),
+            # S6-1: echte Eröffnungszeit verwenden, falls übergeben; sonst jetzt
+            # (Shadows/Synthetik geben keine → behalten bisheriges Verhalten).
+            opened_at or datetime.now(timezone.utc).isoformat(),
             datetime.now(timezone.utc).isoformat() if exit_price is not None else None,
             weight,
             macd_diff, macd_signal_val, ema_ratio_9_21, ema_ratio_21_50, price_vs_ema50,
@@ -214,11 +217,20 @@ def update_network_trade_outcome(trade_id: int, exit_price: float, pnl: float,
         conn.close()
 
 
-def get_bot_stats(bot_id: int, min_trades: int = 0) -> dict:
-    """Gibt Statistiken für einen Bot zurück (nur echte Trades)."""
+def get_bot_stats(bot_id: int, min_trades: int = 0, since: str = None) -> dict:
+    """
+    Gibt Statistiken für einen Bot zurück (nur echte Trades).
+    since: optionaler ISO-Zeitstempel – nur Trades ab diesem Zeitpunkt (H5-Fix für PBT).
+    """
     conn = get_connection()
     try:
-        row = conn.execute("""
+        where_since = ""
+        params: list = [bot_id]
+        if since:
+            where_since = " AND closed_at >= ?"
+            params.append(since)
+
+        row = conn.execute(f"""
             SELECT
                 COUNT(*) as total,
                 SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
@@ -228,8 +240,8 @@ def get_bot_stats(bot_id: int, min_trades: int = 0) -> dict:
                 MAX(pnl) as max_pnl
             FROM trades_network
             WHERE bot_id=? AND is_shadow=0 AND is_synthetic=0
-              AND exit_price IS NOT NULL AND pnl IS NOT NULL
-        """, (bot_id,)).fetchone()
+              AND exit_price IS NOT NULL AND pnl IS NOT NULL {where_since}
+        """, params).fetchone()
 
         if not row or row["total"] < min_trades:
             return {}
@@ -242,21 +254,25 @@ def get_bot_stats(bot_id: int, min_trades: int = 0) -> dict:
             "win_rate":   wins / total,
             "total_pnl":  row["total_pnl"] or 0,
             "avg_pnl":    row["avg_pnl"] or 0,
-            "sharpe":     _calc_sharpe(bot_id, conn),
+            "sharpe":     _calc_sharpe(bot_id, conn, since=since),
         }
     finally:
         conn.close()
 
 
-def _calc_sharpe(bot_id: int, conn: sqlite3.Connection) -> float:
-    """Berechnet Sharpe-Ratio aus den PnL-Werten."""
-    import math
-    rows = conn.execute("""
+def _calc_sharpe(bot_id: int, conn: sqlite3.Connection, since: str = None) -> float:
+    """Berechnet Sharpe-Ratio aus den PnL-Werten (optional ab `since`)."""
+    where_since = ""
+    params: list = [bot_id]
+    if since:
+        where_since = " AND closed_at >= ?"
+        params.append(since)
+    rows = conn.execute(f"""
         SELECT pnl FROM trades_network
         WHERE bot_id=? AND is_shadow=0 AND is_synthetic=0
-          AND pnl IS NOT NULL
+          AND pnl IS NOT NULL {where_since}
         ORDER BY closed_at
-    """, (bot_id,)).fetchall()
+    """, params).fetchall()
     pnls = [r["pnl"] for r in rows]
     if len(pnls) < 5:
         return 0.0
@@ -265,8 +281,11 @@ def _calc_sharpe(bot_id: int, conn: sqlite3.Connection) -> float:
     return (avg / std) if std > 0 else 0.0
 
 
-def get_all_bot_rankings(min_trades: int = 20) -> List[dict]:
-    """Gibt alle Bots nach Sharpe-Ratio sortiert zurück."""
+def get_all_bot_rankings(min_trades: int = 20, since: str = None) -> List[dict]:
+    """
+    Gibt alle Bots nach Sharpe-Ratio sortiert zurück.
+    since: optionaler ISO-Zeitstempel – nur Trades ab diesem Zeitpunkt (H5-Fix für PBT).
+    """
     conn = get_connection()
     try:
         bot_ids = [r["bot_id"] for r in
@@ -276,7 +295,7 @@ def get_all_bot_rankings(min_trades: int = 20) -> List[dict]:
 
     rankings = []
     for bid in bot_ids:
-        stats = get_bot_stats(bid, min_trades)
+        stats = get_bot_stats(bid, min_trades, since=since)
         if stats:
             rankings.append(stats)
     return sorted(rankings, key=lambda x: x["sharpe"], reverse=True)
@@ -292,9 +311,17 @@ def get_network_summary(since: str = None) -> dict:
     try:
         where_since = ""
         params: list = []
+        # S6-3: realisierte (geschlossene) Trades nach closed_at filtern, nicht
+        # opened_at. Ein in diesem Lauf geschlossener Trade muss zählen, auch wenn
+        # er in einem früheren Lauf eröffnet wurde (carry-over via state.json). Mit
+        # opened_at-Filter fiel z.B. ein +13.46-TP-Win aus dem Bericht (PnL 0.00).
+        where_closed = ""
+        params_closed: list = []
         if since:
             where_since = " AND opened_at >= ?"
             params = [since]
+            where_closed = " AND closed_at >= ?"
+            params_closed = [since]
 
         real = conn.execute(f"""
             SELECT
@@ -304,30 +331,84 @@ def get_network_summary(since: str = None) -> dict:
                 SUM(pnl) as total_pnl
             FROM trades_network
             WHERE is_shadow=0 AND is_synthetic=0
-              AND exit_price IS NOT NULL AND pnl IS NOT NULL {where_since}
-        """, params).fetchone()
+              AND exit_price IS NOT NULL AND pnl IS NOT NULL {where_closed}
+        """, params_closed).fetchone()
 
-        open_real = conn.execute(f"""
+        # Geschlossene echte Trades pro Bot (Lauf-Fenster)
+        closed_by_bot = {
+            r["bot_id"]: r["cnt"] for r in conn.execute(f"""
+                SELECT bot_id, COUNT(*) as cnt FROM trades_network
+                WHERE is_shadow=0 AND is_synthetic=0
+                  AND exit_price IS NOT NULL AND pnl IS NOT NULL {where_closed}
+                GROUP BY bot_id ORDER BY cnt DESC
+            """, params_closed).fetchall()
+        }
+
+        # S7-Fix: Offene echte Trades sind ein AKTUELLER Snapshot – NICHT nach
+        # opened_at filtern (sonst verschwinden Carry-over-Positionen aus früheren
+        # Läufen, wie im 12:45-Mikro-Lauf → "offen: 0" trotz 4 offener Positionen).
+        open_real = conn.execute("""
             SELECT COUNT(*) as cnt FROM trades_network
-            WHERE is_shadow=0 AND is_synthetic=0 AND exit_price IS NULL {where_since}
-        """, params).fetchone()
+            WHERE is_shadow=0 AND is_synthetic=0 AND exit_price IS NULL
+        """).fetchone()
+        open_by_bot = {
+            r["bot_id"]: r["cnt"] for r in conn.execute("""
+                SELECT bot_id, COUNT(*) as cnt FROM trades_network
+                WHERE is_shadow=0 AND is_synthetic=0 AND exit_price IS NULL
+                GROUP BY bot_id ORDER BY cnt DESC
+            """).fetchall()
+        }
 
         blocked = conn.execute(f"""
             SELECT COUNT(*) as cnt FROM trades_network
             WHERE (is_shadow=1 OR is_veto=1) {where_since}
         """, params).fetchone()
 
+        # Shadow-Trades: in diesem Lauf erzeugt + aktuell noch offen (Snapshot)
+        shadow_run = conn.execute(f"""
+            SELECT COUNT(*) as cnt FROM trades_network
+            WHERE is_shadow=1 {where_since}
+        """, params).fetchone()
+        shadow_open = conn.execute("""
+            SELECT COUNT(*) as cnt FROM trades_network
+            WHERE is_shadow=1 AND exit_price IS NULL
+        """).fetchone()
+
         return {
-            "real_trades": real["total"] or 0,
-            "wins":        real["wins"] or 0,
-            "losses":      real["losses"] or 0,
-            "total_pnl":   real["total_pnl"] or 0.0,
-            "open":        open_real["cnt"] or 0,
-            "blocked":     blocked["cnt"] or 0,
+            "real_trades":   real["total"] or 0,
+            "wins":          real["wins"] or 0,
+            "losses":        real["losses"] or 0,
+            "total_pnl":     real["total_pnl"] or 0.0,
+            "open":          open_real["cnt"] or 0,
+            "closed_by_bot": closed_by_bot,
+            "open_by_bot":   open_by_bot,
+            "blocked":       blocked["cnt"] or 0,
+            "shadow_run":    shadow_run["cnt"] or 0,
+            "shadow_open":   shadow_open["cnt"] or 0,
         }
     except Exception as e:
         logger.error(f"Network-Summary Fehler: {e}")
         return {}
+    finally:
+        conn.close()
+
+
+def get_open_counts() -> dict:
+    """Aktuell offene Trades (Snapshot) für den Start-Report: echte + Shadow."""
+    conn = get_connection()
+    try:
+        real_open = conn.execute(
+            "SELECT COUNT(*) FROM trades_network "
+            "WHERE is_shadow=0 AND is_synthetic=0 AND exit_price IS NULL"
+        ).fetchone()[0]
+        shadow_open = conn.execute(
+            "SELECT COUNT(*) FROM trades_network "
+            "WHERE is_shadow=1 AND exit_price IS NULL"
+        ).fetchone()[0]
+        return {"real_open": real_open or 0, "shadow_open": shadow_open or 0}
+    except Exception as e:
+        logger.error(f"get_open_counts Fehler: {e}")
+        return {"real_open": 0, "shadow_open": 0}
     finally:
         conn.close()
 
@@ -348,6 +429,33 @@ def get_training_data(symbol: str = None, limit: int = 10_000) -> List[dict]:
         params.append(limit)
         rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_training_data_balanced(per_symbol: int = 8000) -> List[dict]:
+    """
+    B2 — Symbol-balanciertes Sampling: zieht je Symbol bis zu `per_symbol` neueste
+    Outcomes (closed_at DESC) und kombiniert sie. Verhindert die Symbol-Schieflage
+    des globalen LIMIT (sonst dominierte ein Symbol die Trainingsmenge → andere
+    Symbol-Modelle fielen mangels Zeilen auf das Base-Modell zurück).
+    """
+    conn = get_connection()
+    try:
+        symbols = [r[0] for r in conn.execute(
+            "SELECT DISTINCT symbol FROM trades_network "
+            "WHERE exit_price IS NOT NULL AND pnl IS NOT NULL"
+        ).fetchall()]
+        rows: List[dict] = []
+        for sym in symbols:
+            sym_rows = conn.execute(
+                "SELECT * FROM trades_network "
+                "WHERE exit_price IS NOT NULL AND pnl IS NOT NULL AND symbol=? "
+                "ORDER BY closed_at DESC LIMIT ?",
+                (sym, per_symbol),
+            ).fetchall()
+            rows.extend(dict(r) for r in sym_rows)
+        return rows
     finally:
         conn.close()
 

@@ -82,6 +82,10 @@ class PositionState:
         self.atr_at_entry: Optional[float] = data.get("atr_at_entry")
         self.regime_at_entry: Optional[str] = data.get("regime_at_entry")
         self.liquidation_price: Optional[float] = data.get("liquidation_price")
+        # S5-4/S5-5-Fix: Laufzeit-Referenzen für Outcome-Logging (nicht persistiert).
+        self._db_trade_id: int = -1
+        self._score: int = 0
+        self._features: dict = {}
 
     def to_dict(self) -> dict:
         return {
@@ -104,6 +108,10 @@ class PositionState:
         """Setzt die Position zurück (nach Close)."""
         for key in DEFAULT_STATE["open_position"]:
             setattr(self, key, None)
+        # S5-4/S5-5-Fix: Laufzeit-Referenzen ebenfalls zurücksetzen (kein stale read)
+        self._db_trade_id = -1
+        self._score = 0
+        self._features = {}
 
     @property
     def is_open(self) -> bool:
@@ -309,17 +317,46 @@ class BotState:
 
     def update_balance(self, event: dict):
         """
-        Aktualisiert Kontostand aus WebSocket ACCOUNT_UPDATE Event.
+        K-D-Fix: Aktualisiert Kontostand aus dem Kraken-Futures `balances`-WS-Feed.
+        (Vorher las diese Funktion das Binance-Format `event["a"]["B"]`/`"wb"` →
+        account_balance_usdt blieb 0 → Tagesverlust-Limit nie aktiv.)
+
+        Kraken-Feed-Formen (defensiv, mehrere Varianten):
+          flex_futures.portfolio_value  – Gesamtwert inkl. unrealisiertem PnL (bevorzugt)
+          flex_futures.collateral_value – Collateral-Wert
+          holding["USD"] / holding["USDT"]
+          accounts[name]["balances"]["USD"] – wie im REST-Format (get_account_balance)
         """
         try:
-            # Binance ACCOUNT_UPDATE Format
-            balances = event.get("a", {}).get("B", [])
-            for balance in balances:
-                if balance.get("a") == "USDT":
-                    self.account_balance_usdt = float(balance.get("wb", 0))
-                    self.balance_last_synced_utc = datetime.now(timezone.utc).isoformat()
-                    logger.debug(f"Balance aktualisiert: {self.account_balance_usdt:.2f} USDT")
+            new_balance = None
+
+            flex = event.get("flex_futures") or {}
+            for key in ("portfolio_value", "collateral_value", "balance_value"):
+                val = flex.get(key)
+                if val is not None and float(val) > 0:
+                    new_balance = float(val)
                     break
+
+            if new_balance is None:
+                holding = event.get("holding") or {}
+                for cur in ("USD", "USDT"):
+                    if holding.get(cur) is not None and float(holding[cur]) > 0:
+                        new_balance = float(holding[cur])
+                        break
+
+            if new_balance is None:
+                accounts = event.get("accounts") or {}
+                for _, acc_data in accounts.items():
+                    balances = acc_data.get("balances", {}) if isinstance(acc_data, dict) else {}
+                    usd = balances.get("USD", balances.get("USDT"))
+                    if usd is not None and float(usd) > 0:
+                        new_balance = float(usd)
+                        break
+
+            if new_balance is not None and new_balance > 0:
+                self.account_balance_usdt = new_balance
+                self.balance_last_synced_utc = datetime.now(timezone.utc).isoformat()
+                logger.debug(f"Balance aktualisiert: {self.account_balance_usdt:.2f} USD")
         except Exception as e:
             logger.error(f"Fehler beim Aktualisieren der Balance: {e}")
 

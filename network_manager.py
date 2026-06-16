@@ -83,7 +83,9 @@ class ManagedProcess:
                 except Exception:
                     pass
 
-    def restart(self):
+    async def restart(self):
+        # H3-Fix: async statt sync. Vorher blockierte time.sleep(10) den gesamten
+        # asyncio-Event-Loop des Managers (10s × Anzahl abgestürzter Prozesse).
         if self.restarts >= MAX_RESTARTS:
             logger.error(f"{self.name}: Max Neustarts ({MAX_RESTARTS}) erreicht – aufgegeben")
             self.stopped = True
@@ -94,7 +96,7 @@ class ManagedProcess:
             f"Neustart #{self.restarts}: {self.name} "
             f"(war {uptime:.0f}s aktiv, Exit={self.proc.returncode if self.proc else '?'})"
         )
-        time.sleep(RESTART_DELAY)
+        await asyncio.sleep(RESTART_DELAY)
         self.start()
 
 
@@ -161,7 +163,7 @@ class NetworkManager:
 
             for name in dead:
                 logger.warning(f"Prozess abgestürzt: {name}")
-                self._processes[name].restart()
+                await self._processes[name].restart()
 
             active = sum(1 for p in self._processes.values() if p.is_running())
             total  = len(self._processes)
@@ -197,13 +199,52 @@ def _count_bot_configs() -> int:
     return len(list(BOTS_DIR.glob("bot*.json")))
 
 
-def _send_start_telegram(num_bots: int):
-    """EINE Telegram-Nachricht: Netzwerk gestartet, alle Bots laufen."""
+def _port_open(host: str = "127.0.0.1", port: int = 8770, timeout: float = 2.0) -> bool:
+    """Prüft, ob der Data-Hub-Port erreichbar ist (Verbindungs-Check)."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _fmt_bot_counts(d: dict, limit: int = 15) -> str:
+    """Formatiert {bot_id: count} → 'Bot 8×1, Bot 10×1, …'."""
+    if not d:
+        return "–"
+    items = list(d.items())[:limit]
+    s = ", ".join(f"Bot {b}×{c}" for b, c in items)
+    if len(d) > limit:
+        s += f" +{len(d) - limit} weitere"
+    return s
+
+
+def _send_start_telegram(manager: "NetworkManager"):
+    """Start-Status: Bots aktiv, Verbindungen (Hub/Brain), offene Trades."""
     try:
         from notifier import send_telegram_sync
+        from network_db import get_open_counts
+
+        procs = manager._processes
+        total_bots  = manager._num_bots
+        active_bots = sum(1 for n, p in procs.items()
+                          if n.startswith("bot") and p.is_running())
+        hub_proc   = procs.get("data_hub")
+        brain_proc = procs.get("brain")
+        hub_ok   = bool(hub_proc and hub_proc.is_running()) and _port_open()
+        brain_ok = bool(brain_proc and brain_proc.is_running())
+
+        oc = get_open_counts()
+        bots_emoji  = "✅" if active_bots == total_bots else "⚠️"
+        hub_emoji   = "✅" if hub_ok else "❌"
+        brain_emoji = "✅" if brain_ok else "❌"
+
         send_telegram_sync(
-            f"🟢 <b>Netzwerk gestartet</b>\n"
-            f"{num_bots} Bots + Data Hub + Brain laufen.\n"
+            f"🟢 <b>Netzwerk gestartet – Status</b>\n"
+            f"Bots aktiv: {bots_emoji} <b>{active_bots}/{total_bots}</b>\n"
+            f"Data Hub: {hub_emoji} (Port 8770) | Brain: {brain_emoji}\n"
+            f"Offene Trades: <b>{oc['real_open']}</b> echt | {oc['shadow_open']} Shadow\n"
             f"<i>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</i>"
         )
     except Exception as e:
@@ -216,17 +257,21 @@ def _send_shutdown_report(start_iso: str):
         from notifier import send_telegram_sync
         from network_db import get_network_summary
         s = get_network_summary(since=start_iso)
-        wins, losses = s.get("wins", 0), s.get("losses", 0)
-        total = s.get("real_trades", 0)
+        wins   = s.get("wins", 0)
+        total  = s.get("real_trades", 0)
         win_rate = (wins / total * 100) if total else 0.0
         pnl = s.get("total_pnl", 0.0)
         pnl_emoji = "✅" if pnl >= 0 else "❌"
+        closed_bots = _fmt_bot_counts(s.get("closed_by_bot", {}))
+        open_bots   = _fmt_bot_counts(s.get("open_by_bot", {}))
         send_telegram_sync(
             f"🔴 <b>Netzwerk gestoppt – Lauf-Bericht</b>\n"
-            f"Echte Trades: <b>{total}</b> (offen: {s.get('open', 0)})\n"
-            f"Gewinne: {wins} | Verluste: {losses} | WR: {win_rate:.0f}%\n"
-            f"Blockierte Signale: {s.get('blocked', 0)}\n"
-            f"Gesamt-PnL: {pnl_emoji} <b>{pnl:+.2f} USD</b>\n"
+            f"Echte Trades (geschlossen): <b>{total}</b> | WR {win_rate:.0f}% | "
+            f"{pnl_emoji} <b>{pnl:+.2f} USD</b>\n"
+            f"  ↳ {closed_bots}\n"
+            f"Offene echte Trades: <b>{s.get('open', 0)}</b>\n"
+            f"  ↳ {open_bots}\n"
+            f"Shadow-Trades: {s.get('shadow_run', 0)} (offen gesamt: {s.get('shadow_open', 0)})\n"
             f"<i>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</i>"
         )
     except Exception as e:
@@ -256,8 +301,8 @@ async def main(num_bots: int = None):
 
     active = sum(1 for p in manager._processes.values()
                  if p.name.startswith("bot") and p.is_running())
-    logger.info(f"Network-Manager läuft – {manager._num_bots} Bots + Hub + Brain")
-    _send_start_telegram(active)
+    logger.info(f"Network-Manager läuft – {active}/{manager._num_bots} Bots + Hub + Brain")
+    _send_start_telegram(manager)
 
     await stop_event.wait()
 

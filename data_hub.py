@@ -17,7 +17,20 @@ from pathlib import Path
 from typing import Set
 
 import websockets
-from websockets.server import WebSocketServerProtocol
+# S5-6-Fix: WebSocketServerProtocol existiert nur in websockets <15 (Legacy-API).
+# In v15+ heißt der Verbindungstyp ServerConnection. Import resilient halten, damit
+# der Hub nicht beim Import crasht → sonst fallen alle 50 Bots auf Direktverbindungen
+# zu Kraken zurück (503/Rate-Limit). Der Typ wird ausschließlich als Annotation genutzt.
+try:
+    from websockets.server import WebSocketServerProtocol
+except ImportError:  # pragma: no cover
+    try:
+        from websockets.asyncio.server import ServerConnection as WebSocketServerProtocol
+    except ImportError:
+        WebSocketServerProtocol = object  # type: ignore
+
+from dotenv import load_dotenv
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,6 +43,14 @@ HUB_SYMBOLS = [
     "PF_XBTUSD", "PF_ETHUSD", "PF_SOLUSD", "PF_XRPUSD", "PF_LINKUSD",
 ]
 
+# S6-4: Marktdaten-WS IMMER vom Live-Public-Endpoint (öffentlich, keine Auth) —
+# auch im paper-Modus. Der Demo-WS war instabil (HTTP 502 / "no close frame" /
+# häufige Disconnects) und lieferte leicht abweichende Preise (~0.015 %) sowie ein
+# Funding-Artefakt. Fills/Kontostand bleiben lokal simuliert (paper_simulate_fill),
+# Scoring-Kerzen kommen ohnehin von der Live-Charts-REST-API → reine Marktdaten-
+# Quelle, keine Logik-/Feature-Änderung. Ersetzt M14 (modusabhängige URL).
+# Hinweis: Live nutzt den Candle-Feed `candles_trade_15m` (nicht `candles_15`).
+_TRADING_MODE    = os.environ.get("TRADING_MODE", "paper").lower()
 KRAKEN_WS_URL    = "wss://futures.kraken.com/ws/v1"
 LOCAL_HUB_PORT   = int(os.environ.get("HUB_PORT", 8770))
 RECONNECT_DELAY  = 5  # Sekunden zwischen Reconnect-Versuchen
@@ -47,12 +68,14 @@ async def _broadcast(message: str):
     async with _clients_lock:
         if not _clients:
             return
-        dead = set()
-        for ws in _clients:
-            try:
-                await ws.send(message)
-            except Exception:
-                dead.add(ws)
+        # H4-Fix: parallel senden. Vorher blockierte ein langsamer Bot (await ws.send)
+        # die Weitergabe an alle anderen 49 → Ticker-Stau für das ganze Netz.
+        targets = list(_clients)
+        results = await asyncio.gather(
+            *[ws.send(message) for ws in targets],
+            return_exceptions=True,
+        )
+        dead = {ws for ws, res in zip(targets, results) if isinstance(res, Exception)}
         _clients.difference_update(dead)
 
 
@@ -93,11 +116,20 @@ async def _kraken_listener():
     })
     subscribe_candles_15 = json.dumps({
         "event":    "subscribe",
-        "feed":     "candles_15",
+        "feed":     "candles_trade_15m",   # S6-4: Live-Feed-Name (Demo war candles_15)
         "product_ids": HUB_SYMBOLS,
     })
 
+    # Exponentieller Reconnect-Backoff: bei aufeinanderfolgenden Fehlversuchen
+    # (z.B. Kraken-503/1013-Stürmen) wächst die Wartezeit 5→10→20→40→60s, statt
+    # fix alle 5s zu hämmern (was 503-Rate-Limits verlängern kann). Sobald wieder
+    # echte Daten fließen, springt sie auf den Basiswert zurück. Reines
+    # Reconnect-Timing – an der Datenverarbeitung/Broadcast ändert sich nichts.
+    backoff = RECONNECT_DELAY
+    MAX_BACKOFF = 60
+
     while True:
+        got_data = False
         try:
             logger.info(f"Verbinde zu Kraken WS: {KRAKEN_WS_URL}")
             async with websockets.connect(
@@ -111,6 +143,7 @@ async def _kraken_listener():
                 logger.info(f"Abonniert: {len(HUB_SYMBOLS)} Symbole")
 
                 async for raw in ws:
+                    got_data = True
                     try:
                         msg = json.loads(raw)
                         feed = msg.get("feed", "")
@@ -134,8 +167,13 @@ async def _kraken_listener():
         except Exception as e:
             logger.error(f"Kraken WS Verbindung verloren: {e}")
 
-        logger.info(f"Reconnect in {RECONNECT_DELAY}s...")
-        await asyncio.sleep(RECONNECT_DELAY)
+        # Backoff: nach erfolgreichem Datenempfang zurücksetzen, sonst verdoppeln (Deckel 60s)
+        if got_data:
+            backoff = RECONNECT_DELAY
+        else:
+            backoff = min(backoff * 2, MAX_BACKOFF)
+        logger.info(f"Reconnect in {backoff}s...")
+        await asyncio.sleep(backoff)
 
 
 async def _hub_stats_loop():
