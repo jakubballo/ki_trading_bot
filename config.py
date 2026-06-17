@@ -64,7 +64,17 @@ DEFAULT_CONFIG = {
     },
 
     "ml": {
-        "veto_threshold": 0.42,       # P(win) < Schwelle → Signal verworfen
+        "veto_threshold": 0.42,       # Modell B: P(win) < Schwelle → Signal verworfen
+        # ── Modell A (Candle-Richtung) Veto-Politik (Session 10) ──
+        # "contradict" (Default): Modell A blockt NUR, wenn es die GEGENrichtung des
+        #   Signals mit Konfidenz >= candle_contradict_conf vorhersagt. Sonst geht das
+        #   Signal an Modell B (das aus echten Outcomes lernt). → B wird der eigentliche
+        #   Filter, die Lernschleife läuft. Empfohlen während der Paper-Lernphase.
+        # "confirm" (alt): Modell A MUSS die Richtung mit >= candle_confirm_conf bestätigen,
+        #   sonst Veto. Ultra-konservativ (~1,7 % Durchlass), schnürt das Lernen zu.
+        "candle_veto_mode": "contradict",
+        "candle_contradict_conf": 0.55,  # contradict-Modus: P(Gegenrichtung) >= → Veto
+        "candle_confirm_conf": 0.55,     # confirm-Modus: P(Richtung) < → Veto
         "min_samples_symbol": 150,    # Min Samples für Symbol-Modell (Session-2-Fix)
         "min_samples_base": 200,      # Min Samples für Basis-Modell (Session-2-Fix)
         "retrain_every_n": 50,        # Retrain alle N neuen Outcomes
@@ -83,6 +93,10 @@ DEFAULT_CONFIG = {
         "exploration_rate": 0.10,     # Wahrscheinlichkeit, ein Grauzonen-Veto zu überstimmen
         "exploration_band": 0.10,     # nur wenn P(win) >= veto_threshold - band ("knapp daneben")
         "exploration_min_score": 0,   # nur Signale mit |score| >= diesem Wert (0 = aus)
+        # A1b (Session 10) — Exploration darf auch ein Modell-A-Veto überstimmen, damit
+        # die Lernschleife nie wieder vollständig zugeht (selbst im "confirm"-Modus oder
+        # bei sehr enger contradict_conf). Erzeugt echte Labels gegen ein überzeugtes A.
+        "exploration_over_candle": True,
     },
 
     "pbt_mutable": False,             # Darf der PBT-Selektor diese Config ändern?

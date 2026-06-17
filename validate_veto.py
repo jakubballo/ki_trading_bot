@@ -10,6 +10,14 @@ Aufruf:
   python validate_veto.py --bot 3    # nur Bot 3
 """
 
+import sys
+# Box-Zeichen (─) sicher ausgeben — sonst UnicodeEncodeError auf Windows-cp1252-Konsole.
+# Auf UTF-8/VPS ein No-op. Reines Reporting, keine Logik betroffen.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 import argparse
 import logging
 from datetime import datetime, timezone, timedelta

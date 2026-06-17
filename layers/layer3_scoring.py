@@ -82,32 +82,49 @@ def _exploration_override(result: ScoringResult, prob: float, threshold: float) 
     return random.random() < config.ml.get("exploration_rate", 0.10)
 
 
+def _exploration_override_a(result: ScoringResult) -> bool:
+    """
+    A1b — Erlaubt Exploration, ein Modell-A-Veto zu überstimmen, damit die
+    Lernschleife nie vollständig zugeht (auch im confirm-Modus / bei enger
+    contradict_conf). Mode-agnostisch: feuert mit exploration_rate, optional
+    nur ab |score| >= exploration_min_score. Im Paper-Modus risikolos.
+    """
+    if not config.ml.get("exploration_enabled", False):
+        return False
+    if not config.ml.get("exploration_over_candle", True):
+        return False
+    min_score = config.ml.get("exploration_min_score", 0)
+    if min_score and abs(result.score) < min_score:
+        return False
+    return random.random() < config.ml.get("exploration_rate", 0.10)
+
+
 def _apply_ml_veto(result: ScoringResult, symbol: str) -> ScoringResult:
     """
     Zweistufiges ML-Veto:
-      1. Candle-Modell (3-Klassen): Konfidenz < 55% ODER falsche Klasse → veto
-      2. Win-Modell (binär): P(win) < 0.42 → veto
+      1. Candle-Modell A (3-Klassen): Politik per config.ml["candle_veto_mode"]
+         ("contradict": nur Gegen-Signal blockt | "confirm": muss bestätigen).
+      2. Win-Modell B (binär): P(win) < veto_threshold → veto.
+    Exploration kann beide Stufen gelegentlich überstimmen (echte Labels sammeln).
     """
     if not result.signal:
         return result
     try:
         from ml_network import ml_network
 
-        # Stufe 1: Candle-Modell (Modell A)
-        ml_dir, confidence = ml_network.predict_direction(symbol, result)
-        if ml_dir is not None:
-            rule_dir = result.direction  # "long" oder "short"
-            if ml_dir == "neutral":
-                logger.info(f"ML-Veto A: {symbol} neutral (conf={confidence:.3f})")
-                result.signal = False
-                result.veto_reason = f"ml_neutral(conf={confidence:.3f})"
-                return result
-            if ml_dir != rule_dir:
-                logger.info(f"ML-Veto A: {symbol} Richtung widerspricht "
-                            f"(Regel={rule_dir}, ML={ml_dir}, conf={confidence:.3f})")
-                result.signal = False
-                result.veto_reason = f"ml_conflict({rule_dir}vs{ml_dir})"
-                return result
+        # Stufe 1: Candle-Modell (Modell A) — config-getriebene Politik
+        a_vetoed, a_reason, _a_info = ml_network.candle_veto(symbol, result)
+        if a_vetoed:
+            if _exploration_override_a(result):
+                result.exploration = True
+                result.details["_exploration"] = 1.0
+                logger.info(f"ML-Veto A: {symbol} {a_reason} "
+                            f"→ EXPLORATION (Veto überstimmt)")
+                return result  # Signal bleibt aktiv, Stufe B wird bewusst übersprungen
+            logger.info(f"ML-Veto A: {symbol} {a_reason}")
+            result.signal = False
+            result.veto_reason = a_reason
+            return result
 
         # Stufe 2: Win-Modell (Modell B)
         prob = ml_network.predict_win_prob(symbol, result)

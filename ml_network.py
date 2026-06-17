@@ -238,6 +238,49 @@ def generate_strict_labels(
     return labels
 
 
+def candle_direction_verdict(proba, rule_dir: str):
+    """
+    Reine Politik-Funktion für das Modell-A-Veto (Session 10). Geteilt von
+    layer3 (Live) und walkforward (OOS-Test), damit beide IDENTISCH entscheiden.
+
+    proba:    [P(neutral), P(long), P(short)]  (3-Klassen-Softprob aus Modell A)
+    rule_dir: "long" | "short"  (Richtung des Regel-Signals)
+
+    Returns: (vetoed: bool, reason: str|None, info: dict)
+
+    Modus per config.ml["candle_veto_mode"]:
+      • "contradict" (Default): blockt NUR, wenn Modell A die GEGENrichtung mit
+        Konfidenz >= candle_contradict_conf vorhersagt. Modell B wird dadurch der
+        eigentliche Filter und lernt aus den entstehenden echten Outcomes.
+      • "confirm" (alt): Modell A muss die Richtung mit Konfidenz
+        >= candle_confirm_conf bestätigen, sonst Veto (neutral ODER Gegenrichtung).
+    """
+    p_neu, p_long, p_short = float(proba[0]), float(proba[1]), float(proba[2])
+    if rule_dir == "long":
+        p_same, p_opp = p_long, p_short
+    else:
+        p_same, p_opp = p_short, p_long
+    info = {"p_neutral": p_neu, "p_same": p_same, "p_opp": p_opp}
+
+    mode = config.ml.get("candle_veto_mode", "contradict")
+    if mode == "confirm":
+        conf_min = config.ml.get("candle_confirm_conf", 0.55)
+        cls   = int(np.argmax(proba))
+        conf  = float(proba[cls])
+        dname = CLASS_NAMES.get(cls, "neutral")
+        if conf < conf_min:
+            return True, f"ml_neutral(conf={conf:.3f})", info
+        if dname != rule_dir:
+            return True, f"ml_conflict({rule_dir}vs{dname})", info
+        return False, None, info
+
+    # Default: "contradict" — nur ein überzeugtes Gegen-Signal blockt.
+    contra = config.ml.get("candle_contradict_conf", 0.55)
+    if p_opp >= contra:
+        return True, f"ml_contradict({rule_dir},p_gegen={p_opp:.3f})", info
+    return False, None, info
+
+
 # ────────────────────────────── ML-Netzwerk ───────────────────────────────────
 
 class MLNetwork:
@@ -290,6 +333,29 @@ class MLNetwork:
         except Exception as e:
             logger.debug(f"predict_direction Fehler: {e}")
             return None, 0.0
+
+    def candle_veto(self, symbol: str, scoring_result):
+        """
+        Modell-A-Gate gemäß config-Politik (contradict/confirm, Session 10).
+        Returns: (vetoed: bool, reason: str|None, info: dict).
+        Bei fehlendem Modell/Feature/Richtung → (False, None, {}) (kein Veto,
+        Signal geht weiter an Modell B) — identisch zum alten "ml_dir is None"-Pfad.
+        """
+        feat = _candle_features_from_result(scoring_result)
+        if feat is None:
+            return False, None, {}
+        model = self._candle_models.get(symbol) or self._candle_base
+        if model is None:
+            return False, None, {}
+        rule_dir = getattr(scoring_result, "direction", None)
+        if rule_dir not in ("long", "short"):
+            return False, None, {}
+        try:
+            proba = model.predict_proba(feat)[0]
+            return candle_direction_verdict(proba, rule_dir)
+        except Exception as e:
+            logger.debug(f"candle_veto Fehler: {e}")
+            return False, None, {}
 
     def predict_win_prob(self, symbol: str, scoring_result) -> Optional[float]:
         """

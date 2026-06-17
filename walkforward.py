@@ -135,18 +135,16 @@ def _gen_signals(symbol, klines, regimes, lo, hi):
 
 def _is_vetoed(r, regime, strategy, model_a, model_b):
     """Repliziert das Live-Veto (layer3): Modell A (Richtung/Konfidenz) → Modell B (P(win))."""
-    from ml_network import _candle_features_from_result, REGIME_MAP, STRATEGY_MAP, CLASS_NAMES
-    # Stufe A
+    from ml_network import (_candle_features_from_result, REGIME_MAP, STRATEGY_MAP,
+                            candle_direction_verdict)
+    # Stufe A — identische Politik wie live (config.ml["candle_veto_mode"])
     if model_a is not None:
         feat = _candle_features_from_result(r)
-        if feat is not None:
+        if feat is not None and r.direction in ("long", "short"):
             try:
                 proba = model_a.predict_proba(feat)[0]
-                cls = int(np.argmax(proba))
-                conf = float(proba[cls])
-                if conf < CONF_THRESHOLD:
-                    return True
-                if CLASS_NAMES.get(cls, "neutral") != r.direction:
+                vetoed, _reason, _info = candle_direction_verdict(proba, r.direction)
+                if vetoed:
                     return True
             except Exception:
                 pass
