@@ -276,10 +276,10 @@ def best_strategy_per_coin(bot_meta: dict[int, tuple[str, str]]) -> dict[str, di
 
 def read_open_position(bot_id: int) -> dict | None:
     """
-    Liest die offene Position eines Bots aus data/bot{id}/state.json.
+    Liest die offene Position eines Bots aus data/bot{id}/bot_state.json.
     Gibt None zurück, wenn keine offen / Datei fehlt / unleserlich.
     """
-    f = STATE_DIR / f"bot{bot_id}" / "state.json"
+    f = STATE_DIR / f"bot{bot_id}" / "bot_state.json"
     if not f.exists():
         return None
     try:
