@@ -13,13 +13,34 @@ KERN-PRINZIPIEN
     BossBot später live geht – ohne TRADING_MODE zu kippen.
 
 ABGUCK-LOGIK
-  - Ranking (stündlich): bester Bot PRO Coin nach Winrate (seit Start,
-    min. BOSSBOT_MIN_TRADES geschlossene Trades) → 5 Follow-Bots, einer je Coin.
-    Damit handelt der BossBot automatisch alle 5 Coins und nimmt pro Coin die
-    aktuell beste Strategie.
-  - Mirroring (alle paar Sekunden): öffnet ein Follow-Bot frisch (<Frische-
-    Fenster) eine Position, spiegelt der BossBot sie – mit eigenem,
-    budget-basiertem Sizing und eigenem SL/TP (Abstände vom Vorbild kopiert).
+  - Ranking (stündlich): pro Coin die beste STRATEGIE – gepoolt über beide
+    Varianten (Standard + Aggressiv).
+      * PAPER (jetzt): KEIN Mindest-Trade-Gate. Folge jeder Strategie mit
+        gepoolter Winrate > BOSSBOT_MIN_WINRATE (70 %). Mehrere über 70 % →
+        die mit den MEISTEN Trades. Bewusst rausch-tolerant, um zu handeln und
+        Daten zu sammeln.
+      * LIVE-TODO (Echtgeld): zusätzlich Robustheits-Gate min. BOSSBOT_MIN_TRADES
+        (z.B. 15) gepoolte Trades UND WR-Schwelle (z.B. ≥ 50 %). Qualifiziert
+        nichts beides → BossBot WARTET (lieber nicht handeln als mittelmäßig
+        kopieren). Siehe Abschnitt LIVE-TODO unten.
+  - Mirroring (alle paar Sekunden): öffnet einer der beiden Varianten-Bots der
+    Gewinner-Strategie frisch (<Frische-Fenster) eine Position, spiegelt der
+    BossBot sie – mit eigenem budget-basiertem Sizing und eigenem SL/TP
+    (Abstände vom Vorbild kopiert), max. 1 Position pro Coin.
+
+LIVE-TODO (vor Echtgeld umsetzen) — Robustes Ranking statt rausch-tolerant:
+  Im Paper-Modus folgt der BossBot bewusst jeder Strategie mit WR > 70 % OHNE
+  Mindest-Trade-Zahl, damit überhaupt gehandelt wird und Daten reinkommen. Das
+  ist für Echtgeld zu rauschanfällig: WR 6/7 = 86 % ist fast sicher Glück.
+  Beim Live-Umstieg daher umstellen auf:
+    (1) Mindest-Trade-Gate aktivieren (z.B. MIN_TRADES = 15 gepoolt) → nur
+        verlässliche Stichproben.
+    (2) WR-Schwelle (z.B. ≥ 50 %, deutlich über Break-even ~33 % bei R:R 1:2).
+    (3) Erfüllt KEINE Strategie×Coin beides → WARTEN statt das am wenigsten
+        schlechte kopieren. Nicht-handeln ist bei einem System ohne belegten
+        Edge die korrekte, kapitalerhaltende Wahl.
+  Optional Stufe 2: innerhalb der Gewinner-Strategie zwischen Standard/Aggressiv
+  wählen — erst sinnvoll, wenn JEDE Variante ~30–50 Trades hat (sonst Rauschen).
 
 BUDGET
   - Startkapital BOSSBOT_START_CAPITAL (default 100), persistent, wird NIE
@@ -61,7 +82,7 @@ except Exception:
 
 from config import config
 from exchange import ExchangeClient, BASE_URL_LIVE
-from network_db import get_bot_stats
+from network_db import get_connection
 import bossbot_db
 import bossbot_notifier as tg
 
@@ -85,7 +106,8 @@ LEVERAGE          = _envf("BOSSBOT_LEVERAGE", 3.0)
 MAX_POSITIONS     = _envi("BOSSBOT_MAX_POSITIONS", 2)
 RISK_PER_TRADE    = _envf("BOSSBOT_RISK_PER_TRADE", 0.02)   # 2 % des Kapitals je Trade
 FEE_RATE          = _envf("BOSSBOT_FEE_RATE", 0.0005)        # 0,05 % je Seite
-MIN_TRADES        = _envi("BOSSBOT_MIN_TRADES", 10)          # Ranking-Mindestzahl
+MIN_TRADES        = _envi("BOSSBOT_MIN_TRADES", 15)          # (LIVE-TODO) Robustheits-Gate, im Paper-Modus AUS
+MIN_WINRATE       = _envf("BOSSBOT_MIN_WINRATE", 0.70)        # Paper: folge nur Strategien mit WR > 70 %
 MAX_HOLD_HOURS    = _envf("BOSSBOT_MAX_HOLD_HOURS", 48.0)
 FRESHNESS_SEC     = _envf("BOSSBOT_FRESHNESS_SEC", 90.0)     # nur frische Opens spiegeln
 MAX_SINGLE_RISK   = _envf("BOSSBOT_MAX_SINGLE_RISK", 0.10)   # ein Trade max. 10 % Kapital-Risiko
@@ -183,8 +205,8 @@ class Ledger:
 
 # ─── Bot-Symbol-Mapping ──────────────────────────────────────────────────────
 
-def load_bot_symbols() -> dict[int, str]:
-    """bot_id → Symbol (aus bots/bot{id}.json)."""
+def load_bot_meta() -> dict[int, tuple[str, str]]:
+    """bot_id → (Symbol, Strategie) aus bots/bot{id}.json."""
     mapping = {}
     for bid in range(1, N_BOTS + 1):
         f = BOTS_DIR / f"bot{bid}.json"
@@ -193,27 +215,60 @@ def load_bot_symbols() -> dict[int, str]:
         try:
             cfg = json.loads(f.read_text(encoding="utf-8"))
             sym = cfg.get("symbol")
+            strat = cfg.get("strategy", "unknown")
             if sym:
-                mapping[bid] = sym
+                mapping[bid] = (sym, strat)
         except Exception as e:
             logger.debug(f"Bot-Config {bid} nicht lesbar: {e}")
     return mapping
 
 
-def best_bot_per_coin(bot_symbols: dict[int, str]) -> dict[str, dict]:
+def best_strategy_per_coin(bot_meta: dict[int, tuple[str, str]]) -> dict[str, dict]:
     """
-    Für jeden Coin den Bot mit der höchsten Winrate (seit Start, min. MIN_TRADES).
-    Gibt {symbol: {bot_id, win_rate, total}} zurück.
+    Pro Coin die Strategie, der gefolgt wird – GEPOOLT über die beiden Varianten
+    (Standard + Aggressiv).
+
+    PAPER-MODUS (jetzt): KEIN Mindest-Trade-Gate. Eine Strategie×Coin qualifiziert,
+    wenn ihre gepoolte Winrate > MIN_WINRATE (Default 70 %) ist. Gibt es pro Coin
+    mehrere über 70 %, gewinnt die mit den MEISTEN Trades (Tiebreak: höhere WR).
+    Bewusst rausch-tolerant, um im Paper-Modus überhaupt zu handeln und Daten zu
+    sammeln. Das robustere Gate (min. Trades + WR-Schwelle) ist als LIVE-TODO
+    dokumentiert und greift erst beim Echtgeld-Umstieg.
+
+    Gibt {symbol: {strategy, bot_ids, win_rate, total}} zurück.
     """
+    # bot_ids je (symbol, strategy) gruppieren
+    groups: dict[tuple[str, str], list[int]] = {}
+    for bid, (sym, strat) in bot_meta.items():
+        groups.setdefault((sym, strat), []).append(bid)
+
     by_coin: dict[str, dict] = {}
-    for bid, sym in bot_symbols.items():
-        stats = get_bot_stats(bid, min_trades=MIN_TRADES)
-        if not stats:
-            continue
-        cur = by_coin.get(sym)
-        if cur is None or stats["win_rate"] > cur["win_rate"]:
-            by_coin[sym] = {"bot_id": bid, "win_rate": stats["win_rate"],
-                            "total": stats["total"]}
+    conn = get_connection()
+    try:
+        for (sym, strat), bids in groups.items():
+            placeholders = ",".join("?" * len(bids))
+            row = conn.execute(f"""
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins
+                FROM trades_network
+                WHERE is_shadow=0 AND is_synthetic=0
+                  AND exit_price IS NOT NULL AND pnl IS NOT NULL
+                  AND bot_id IN ({placeholders})
+            """, bids).fetchone()
+            total = (row["total"] if row else 0) or 0
+            if total <= 0:
+                continue
+            win_rate = (row["wins"] or 0) / total
+            if win_rate <= MIN_WINRATE:
+                continue  # Paper: nur Strategien mit WR > 70 %
+            cand = {"strategy": strat, "bot_ids": sorted(bids),
+                    "win_rate": win_rate, "total": total}
+            cur = by_coin.get(sym)
+            # bei mehreren >70 %: die mit MEHR Trades (Tiebreak: höhere WR)
+            if cur is None or (total, win_rate) > (cur["total"], cur["win_rate"]):
+                by_coin[sym] = cand
+    finally:
+        conn.close()
     return by_coin
 
 
@@ -281,21 +336,24 @@ class BossBot:
         # Eigener Modus, unabhängig vom globalen TRADING_MODE der 50 Bots:
         self.client.is_paper = (MODE != "live")
         self.market = MarketData(self.client)
-        self.bot_symbols = load_bot_symbols()
-        self.follow: dict[str, dict] = {}     # symbol → {bot_id, win_rate, total}
+        self.bot_meta = load_bot_meta()
+        # symbol → {strategy, bot_ids, win_rate, total}
+        self.follow: dict[str, dict] = {}
         self._mirrored_keys: set[str] = set()  # (bot_id|entry_time) bereits gespiegelt
         self._last_rank_ts = 0.0
 
     # ── Ranking ──────────────────────────────────────────────────────────────
 
     def refresh_ranking(self):
-        self.follow = best_bot_per_coin(self.bot_symbols)
+        self.follow = best_strategy_per_coin(self.bot_meta)
         if self.follow:
-            lines = [f"{s}: Bot #{d['bot_id']} (WR {d['win_rate']*100:.0f} %, "
-                     f"{d['total']} Trades)" for s, d in sorted(self.follow.items())]
+            lines = [f"{s}: {d['strategy']} {d['bot_ids']} "
+                     f"(WR {d['win_rate']*100:.0f} %, {d['total']} Trades gepoolt)"
+                     for s, d in sorted(self.follow.items())]
             logger.info("Follow-Set aktualisiert | " + " | ".join(lines))
         else:
-            logger.info(f"Follow-Set leer – noch kein Bot mit >= {MIN_TRADES} Trades.")
+            logger.info(f"Follow-Set leer – noch keine Strategie×Coin mit "
+                        f"WR > {MIN_WINRATE*100:.0f} %.")
 
     # ── Sizing ─────────────────────────────────────────────────────────────────
 
@@ -493,17 +551,20 @@ class BossBot:
                 break
             if self.ledger.has_symbol(symbol):
                 continue  # nicht doppelt auf demselben Coin
-            bot_id = info["bot_id"]
-            op = read_open_position(bot_id)
-            if not op or op.get("symbol") != symbol:
-                continue
-            key = f"{bot_id}|{op.get('entry_time_utc')}"
-            if key in self._mirrored_keys:
-                continue
-            if _age_seconds(op.get("entry_time_utc")) > FRESHNESS_SEC:
-                continue  # zu alt – verpasst / Carry-over
-            self._mirrored_keys.add(key)
-            await self.open_position(bot_id, op)
+            # Gewinner-Strategie pro Coin: BEIDE Varianten-Bots beobachten,
+            # spiegeln wir den, der gerade frisch öffnet (max. 1 pro Coin).
+            for bot_id in info["bot_ids"]:
+                op = read_open_position(bot_id)
+                if not op or op.get("symbol") != symbol:
+                    continue
+                key = f"{bot_id}|{op.get('entry_time_utc')}"
+                if key in self._mirrored_keys:
+                    continue
+                if _age_seconds(op.get("entry_time_utc")) > FRESHNESS_SEC:
+                    continue  # zu alt – verpasst / Carry-over
+                self._mirrored_keys.add(key)
+                await self.open_position(bot_id, op)
+                break  # nur eine Position pro Coin
 
     # ── Hauptloop ──────────────────────────────────────────────────────────────
 
@@ -530,7 +591,7 @@ class BossBot:
             await asyncio.sleep(LOOP_SEC)
 
     def _send_start_telegram(self):
-        follow_txt = ", ".join(f"{s.replace('PF_','').replace('USD','')}→#{d['bot_id']}"
+        follow_txt = ", ".join(f"{s.replace('PF_','').replace('USD','')}→{d['strategy']}"
                                for s, d in sorted(self.follow.items())) or "noch leer"
         tg.send(
             f"🤖 <b>BossBot gestartet</b> [{MODE.upper()}]\n"
