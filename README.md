@@ -1,247 +1,177 @@
-# KI-Trading-Bot – Binance Futures
+# Kraken-Futures Bot-Netzwerk — ein ehrliches Krypto-Edge-Forschungsprojekt
 
-Vollautomatischer Trading-Bot für Binance Futures mit 3-Layer-Analyse (Makro, Regime, Scoring), vollständigem Risikomanagement und Telegram-Benachrichtigungen.
+Ein Netzwerk aus 50 parallelen Paper-Trading-Bots auf Kraken Futures, gebaut um
+systematisch zu prüfen, ob sich auf retail-zugänglichen Marktdaten ein
+**handelbarer Edge** finden lässt — mit ML-Veto-Schicht, Walk-Forward-Validierung
+und 24/7-Betrieb auf einem VPS.
+
+> ### TL;DR — der ehrliche Kernbefund
+> Nach einer systematischen Suche über alle zugänglichen Preis- und Funding-Signale
+> (15min bis Daily, Time-Series und Cross-Sectional über bis zu 308 Instrumente,
+> Funding-Carry und Funding-Crowding) gilt: **Es wurde kein statistisch belastbarer,
+> nach Kosten handelbarer Edge gefunden.** Das ist kein Bug — es ist das erwartbare
+> Ergebnis für die liquidesten, meist-arbitragierten Instrumente. Das einzige Signal
+> mit einem konsistenten, theoriekonformen Fingerabdruck (Funding-Crowding) blieb
+> unter der Signifikanzschwelle. Das Projekt wurde nach diesem Befund **bewusst
+> gestoppt** — ohne ein System auf ein unbewiesenes Signal zu bauen.
+>
+> **Reines Paper-Trading. Kein echtes Kapital wurde je riskiert.**
 
 ---
 
-## Projektstruktur
+## Warum dieses Repo trotzdem nützlich ist
+
+Die meisten öffentlichen „Trading-Bot"-Repos behaupten zu funktionieren und zeigen
+überangepasste Backtests. Dieses Repo dokumentiert das Gegenteil ehrlich: eine
+methodisch saubere Edge-Suche, die zu einem **negativen Ergebnis** kam — inklusive
+der reproduzierbaren Skripte, die jeden Befund belegen. Ein dokumentiertes ehrliches
+Negativ-Ergebnis ist wertvoller als ein geschöntes Positiv-Ergebnis.
+
+---
+
+## Was das System tut (Architektur)
+
+50 unabhängige Bot-Prozesse (5 Symbole × 5 Strategien × 2 Risiko-Varianten), die
+gemeinsam über eine geteilte Datenbank lernen. Kein Docker — direkte Python-Prozesse,
+orchestriert per `network_manager.py`, 24/7 auf einem Hetzner-VPS (systemd).
 
 ```
-ki_trading_bot/
-├── main.py                  # Einstiegspunkt, Scheduler, Hauptloop, Kill-Switch
-├── config.py                # Lädt ki_trading_bot_v4_config.json
-├── state.py                 # State-Persistenz (bot_state.json), atomares Schreiben
-├── exchange.py              # Binance Futures API-Wrapper
-├── websocket_manager.py     # WebSocket Market + User Data Stream
-├── layers/
-│   ├── layer1_macro.py      # Makro-Filter (yfinance, SPX, DXY)
-│   ├── layer2_regime.py     # ADX-Regime-Erkennung (4h, alle 4h)
-│   └── layer3_scoring.py    # 15min Scoring (RSI, MACD, Bollinger, F&G)
-├── risk_gate.py             # 7 sequentielle Risk-Checks
-├── order_manager.py         # Order-Lifecycle, SL/TP, Retry-Logik
-├── position_monitor.py      # Liquidation, Haltedauer, Funding
-├── watchdog.py              # Heartbeat-Datei
-├── notifier.py              # Telegram-Alerts
-├── logger_db.py             # SQLite Trade-Logging
-├── data/                    # State, Heartbeat, SQLite-DB (wird automatisch erstellt)
-└── logs/                    # Log-Dateien (wird automatisch erstellt)
+network_manager.py   Orchestrierung, Telegram-Start/-Shutdown-Report
+  ├── data_hub.py    Ein Kraken-WebSocket für alle 50 Bots (Port 8770)
+  ├── brain.py       Scheduler: ML-Training, PBT, Dashboard, Daten-Updates
+  └── main.py × 50   Bot-Hauptloop (1 Prozess/Bot)
+
+Signal-Pipeline pro Bot:
+  Marktdaten → scoring_core.py (5 Strategien, 21 Features, Regime-Gate)
+            → layer1_macro (Makro-Filter) → layer2_regime (4h-ADX)
+            → layer3_scoring → ML-Veto (Modell A Richtung → Modell B Win-P)
+            → risk_gate.py (Verlustlimits, Funding, Volatilität)
+            → Paper-Order
 ```
 
+**ML-Veto, zwei Ebenen** (`ml_network.py`):
+- **Modell A** (XGBoost, 3 Klassen): Kerzen-Richtung, trainiert aus 4,2 Jahren Historie.
+- **Modell B** (XGBoost, binär): Win-Wahrscheinlichkeit, lernt stündlich aus echten +
+  Shadow- + synthetischen Outcomes (`network.db`).
+
+Alle blockierten Signale werden als **Shadow-Trades** virtuell weiterverfolgt, damit
+das System auch aus nicht-gehandelten Signalen lernt.
+
+**Symbole:** PF_XBTUSD, PF_ETHUSD, PF_SOLUSD, PF_XRPUSD, PF_LINKUSD (Kraken Perpetuals).
+
 ---
 
-## Voraussetzungen
+## Die Edge-Forschung — vollständige Bilanz
 
-- Python 3.11+
-- Docker & Docker Compose (für Deployment)
-- Binance-API-Key mit Futures-Berechtigung
-- Telegram-Bot (optional aber empfohlen)
+Jede Idee wurde mit derselben Disziplin geprüft: **Out-of-Sample-Walk-Forward**
+(Parameter in-sample wählen, OOS testen), **Bootstrap-Konfidenzintervalle**,
+**Edge-vs-Beta-Trennung** und realistische Gebühren. Die Messlatte war stets
+*Expectancy nach Kosten mit CI über 0* — niemals Accuracy oder Win-Rate, und die
+Schwelle wurde nie gesenkt, um ein schwaches Signal schönzureden.
+
+| # | Ansatz | Daten | Ergebnis | Skript |
+|---|---|---|---|---|
+| 1 | 5 Regel-Strategien | 15min, 5 Sym | Kein Edge — alle Strategien negativ nach Kosten | `threshold_sweep.py` |
+| 2 | Time-Series-Momentum | Daily, 5 Sym | Nur Long-**Beta**, kein Timing-Alpha (Filter +0,45 %/Trade, nicht von 0 unterscheidbar) | `daily_backtest.py` |
+| 3 | Cross-Sectional L/S (eng) | Daily, 5 Sym | Kein OOS-Alpha (−0,34 %/Reb, t=−0,88) | `signal_scan.py` |
+| 4 | Cross-Sectional Momentum (breit) | Daily, **308 Perps** | Kein Signal — in-sample kein t>1,8, OOS negativ | `breadth_momentum.py` |
+| 5 | Funding-Carry | stündl., 5 Sym | Real aber marginal (~2,5 %/J, in *einem* Quartal konzentriert); aktiv nicht handelbar (2–5 Vorzeichen-Flips/Tag) | `funding_carry.py` |
+| 6 | **Funding-Crowding** (contrarian) | stündl., 5 Sym | **Schwacher, konsistent richtig gerichteter Fingerabdruck** — aber unter Signifikanz | `funding_signal.py`, `funding_crowding_deep.py` |
+
+### Detail-Befunde
+
+**Daily-Momentum war nur Beta.** Ein sauberer Walk-Forward ergab +1,40 %/Trade
+(t=2,13), aber der Vergleich gegen einen unkonditionierten Long zeigte: ~2/3 davon
+ist reine Krypto-Aufwärtsdrift. Der Momentum-*Filter* trug nur +0,45 %/Trade bei —
+statistisch nicht von 0 unterscheidbar. Sein einziger realer Wert ist
+Drawdown-Reduktion (Portfolio-Sharpe 0,76 vs Buy&Hold 0,71; max. Drawdown −45 %
+statt −65 %) — kein Alpha, das ein System rechtfertigt.
+
+**Breite war nicht die Lösung.** Cross-Sectional-Momentum über alle 308 handelbaren
+Kraken-Perps — die dokumentierte Edge-Bedingung — zeigte selbst *in-sample und mit
+Survivorship-Bias als Rückenwind* kein einziges signifikantes Setup. Das breite
+Altcoin-Universum verlor über den Zeitraum sogar im Schnitt.
+
+**Funding-Crowding war das einzige Lebenszeichen.** Die Korrelation zwischen Funding
+und Forward-Rendite war bei *allen 5 Symbolen und allen Horizonten* negativ (genau wie
+die Crowding-Theorie vorhersagt: überhebelte Longs → Reversal). Die Asymmetrie war
+theoriekonform (die Long-Crowd-Seite trägt das Signal). Aber: kein Konfidenzintervall
+räumte die Null, und der Effekt schärfte sich am extremen Rand *nicht* — in ~1 Jahr
+Funding-Historie (Krakens Limit) nicht als handelbar nachweisbar.
 
 ---
 
-## Schnellstart (lokal)
+## Befunde reproduzieren
 
 ```bash
-# 1. Repository klonen / Dateien kopieren
 cd ki_trading_bot
+pip install -r requirements.txt   # pandas, numpy, scipy, xgboost, ...
 
-# 2. .env erstellen
-cp .env.example .env
-# .env mit echten Werten befüllen (TRADING_MODE=paper für Tests!)
+# 1. Daily-Momentum: Walk-Forward, Edge-vs-Beta, Gebühren-Sensitivität
+python daily_backtest.py          # Edge-Checks
+python daily_backtest.py --risk   # Sharpe / Drawdown vs Buy&Hold
 
-# 3. Abhängigkeiten installieren
-pip install -r requirements.txt
+# 2. Cross-Sectional (5 Symbole)
+python signal_scan.py             # In-Sample-Grid
+python signal_scan.py --wf        # Walk-Forward OOS
 
-# 4. Bot starten
-python main.py
+# 3. Cross-Sectional auf Breite (308 Perps; lädt Daten von Krakens Public-API)
+python breadth_momentum.py --fetch   # Daily-Historie cachen (~3 Min)
+python breadth_momentum.py           # In-Sample-Grid
+python breadth_momentum.py --wf      # Walk-Forward OOS
+
+# 4. Funding-Carry (lädt Funding-Historie von Krakens Public-API)
+python funding_carry.py --refresh
+
+# 5. Funding-Crowding (prädiktives Signal)
+python funding_signal.py             # Korrelation + TS/XS-Contrarian
+python funding_crowding_deep.py      # Extrem-Rand, Asymmetrie, Spike
 ```
+
+Alle Validierungs-Skripte sind **reines Offline-Backtesting** (plus lesende
+Public-API-Abrufe) und berühren das Live-Trading-System nicht.
 
 ---
 
-## VPS-Deployment mit Docker
+## Was funktioniert (Infrastruktur)
 
-### 1. VPS vorbereiten (Ubuntu 22.04)
+Auch wenn kein Trading-Edge gefunden wurde, ist das technische Gerüst solide und
+lief monatelang stabil:
 
-```bash
-# System aktualisieren
-sudo apt update && sudo apt upgrade -y
-
-# Docker installieren
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-
-# Docker Compose installieren
-sudo apt install docker-compose-plugin -y
-
-# Neu einloggen damit Gruppe aktiv wird
-exit
-```
-
-### 2. Projektdateien auf VPS kopieren
-
-```bash
-# Von lokalem Rechner auf VPS kopieren
-scp -r ki_trading_bot/ user@DEINE_VPS_IP:~/
-
-# Oder per Git
-ssh user@DEINE_VPS_IP
-git clone https://github.com/dein-repo/ki_trading_bot.git
-```
-
-### 3. Konfiguration einrichten
-
-```bash
-cd ki_trading_bot
-
-# .env aus Vorlage erstellen
-cp .env.example .env
-nano .env
-```
-
-`.env` befüllen:
-```
-BINANCE_API_KEY=dein_echter_api_key
-BINANCE_SECRET=dein_echter_secret
-TELEGRAM_BOT_TOKEN=dein_bot_token
-TELEGRAM_CHAT_ID=deine_chat_id
-TRADING_MODE=paper   # ERST paper testen, dann live!
-```
-
-### 4. Docker-Container starten
-
-```bash
-# Image bauen und starten
-docker compose up -d
-
-# Logs live verfolgen
-docker compose logs -f
-
-# Status prüfen
-docker compose ps
-```
-
-### 5. Bot überwachen
-
-```bash
-# Live-Logs
-docker compose logs -f trading-bot
-
-# Heartbeat prüfen
-cat data/heartbeat.json
-
-# Trades anschauen (SQLite)
-sqlite3 data/trades.db "SELECT * FROM trades ORDER BY id DESC LIMIT 10;"
-```
-
-### 6. Bot stoppen/neustarten
-
-```bash
-# Stoppen
-docker compose down
-
-# Neustarten
-docker compose restart trading-bot
-
-# Kill-Switch via Telegram: /killswitch senden
-```
+- 50 parallele Bot-Prozesse über einen geteilten WebSocket-Hub (kein Rate-Limit-Problem)
+- Zwei-Ebenen-ML-Veto mit stündlichem Online-Retraining aus Live-Outcomes
+- Shadow-Trade-System (Lernen aus blockierten Signalen)
+- Walk-Forward-, Expectancy- und Veto-Wirkungs-Validierung als eigene Tools
+- 24/7 auf Hetzner-VPS via systemd + Git-Deploy, mit Telegram-Reporting
+- Vollständige Outcome-Persistenz in SQLite (WAL), übersteht Neustarts
 
 ---
 
-## Konfiguration (ki_trading_bot_v4_config.json)
+## Status
 
-Erstelle diese Datei im Projektverzeichnis:
+**Gestoppt.** Die Edge-Suche ist abgeschlossen und ehrlich beantwortet: Auf
+retail-zugänglichen Preis- und Funding-Daten über Kraken existiert kein handelbarer
+Edge. Echte Edges in Krypto leben dort, wo Infrastruktur (Latenz, Co-Location),
+teure Daten (on-chain, saubere Historie) oder Illiquidität ins Spiel kommen — nicht
+in cleveren Formeln auf liquiden Preisdaten.
 
-```json
-{
-  "symbols": ["BTCUSDT"],
-  "leverage": 3,
-  "margin_type": "ISOLATED",
-  "risk": {
-    "max_position_size_pct": 0.10,
-    "daily_loss_limit_pct": 0.03,
-    "max_hold_hours": 48,
-    "sl_atr_multiplier": 2.0,
-    "tp_atr_multiplier": 3.0,
-    "max_atr_ratio": 3.0,
-    "max_funding_rate": 0.0005,
-    "max_consecutive_negative_weeks": 3
-  },
-  "scoring": {
-    "min_score_long": 3,
-    "min_score_short": -3
-  }
-}
-```
+Der einzige Thread mit Substanz (Funding-Crowding, direkter messbar über
+Liquidations-Daten) bliebe ein Daten-Sammel-Projekt über Monate mit unsicherem
+Ausgang — bewusst nicht weiterverfolgt.
 
 ---
 
-## Telegram-Bot einrichten
+## Sicherheit
 
-1. Bei [@BotFather](https://t.me/BotFather) einen neuen Bot erstellen → `/newbot`
-2. Den `BOT_TOKEN` kopieren
-3. Bot starten und Chat-ID ermitteln: `https://api.telegram.org/bot<TOKEN>/getUpdates`
-4. Werte in `.env` eintragen
-
-### Verfügbare Befehle
-
-- `/killswitch` – Bot sofort stoppen und alle Positionen schließen
-
----
-
-## Sicherheitshinweise
-
-- **Immer erst im Paper-Modus testen!** (`TRADING_MODE=paper`)
-- API-Key nur mit Futures-Berechtigung, **KEIN Withdraw-Recht**
-- IP-Whitelist für API-Key in Binance-Einstellungen aktivieren
-- `.env` niemals in Git committen!
-- Regelmäßige Backups der `data/` Verzeichnisses
-
----
-
-## Monitoring & Troubleshooting
-
-### Bot reagiert nicht
-```bash
-docker compose restart trading-bot
-cat data/heartbeat.json  # Prüfen ob alive=true
-```
-
-### Datenbank-Fehler
-```bash
-sqlite3 data/trades.db ".tables"
-sqlite3 data/trades.db "SELECT * FROM errors ORDER BY id DESC LIMIT 5;"
-```
-
-### State zurücksetzen
-```bash
-# Backup erstellen
-cp data/bot_state.json data/bot_state_backup_$(date +%Y%m%d).json
-# State-Datei löschen (Bot startet mit leerem State)
-rm data/bot_state.json
-docker compose restart trading-bot
-```
-
----
-
-## Architektur
-
-```
-WebSocket (15m Kerze) → trigger_scoring_cycle()
-                              ↓
-                    Layer 3 Scoring (RSI, MACD, BB, F&G)
-                              ↓
-                    Layer 2 Regime (gecacht, nur alle 4h)
-                              ↓
-                    Layer 1 Makro (gecacht, alle 12h)
-                              ↓
-                    Risk Gate (7 Checks)
-                              ↓
-                    Entry Order (LIMIT, GTC)
-                              ↓
-                    On Fill → SL + TP setzen (parallel)
-```
+- `.env` enthält API-Keys und Telegram-Tokens — **niemals committen** (steht in `.gitignore`).
+- Das System lief ausschließlich im **Paper-Modus**. Live-Keys waren nie aktiv.
+- API-Keys (falls je live) nur mit Trade-, **nie** mit Withdraw-Recht, plus IP-Whitelist.
 
 ---
 
 ## Disclaimer
 
-Dieser Bot ist ein experimentelles Tool. Trading mit Hebel ist hochriskant und kann zum vollständigen Kapitalverlust führen. Verwende nur Kapital, dessen Verlust du dir leisten kannst. Keine Anlageberatung.
+Experimentelles Forschungsprojekt. **Keine Anlageberatung.** Trading mit Hebel ist
+hochriskant. Das zentrale Ergebnis dieses Projekts ist gerade, dass die hier
+untersuchten Strategien **keinen** handelbaren Edge hatten — sie sollten nicht mit
+echtem Kapital gehandelt werden.

@@ -13,6 +13,8 @@ data/trades.db
 data/*.db-wal
 data/*.db-shm
 data/history/
+data/perp_daily/
+data/funding/
 data/ml_models/
 data/bot*/
 data/bot_state.json
