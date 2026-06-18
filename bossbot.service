@@ -1,0 +1,17 @@
+[Unit]
+Description=BossBot (Kraken Futures Copy-Trader, eigenstaendig neben tradebot)
+After=network-online.target tradebot.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/ki_trading_bot
+EnvironmentFile=/root/ki_trading_bot/.env
+ExecStart=/root/ki_trading_bot/.venv/bin/python bossbot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/root/ki_trading_bot/logs/bossbot.log
+StandardError=append:/root/ki_trading_bot/logs/bossbot.log
+
+[Install]
+WantedBy=multi-user.target

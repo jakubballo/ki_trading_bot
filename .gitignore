@@ -9,6 +9,8 @@
 data/network.db
 data/network.db-wal
 data/network.db-shm
+data/bossbot_trades.db
+data/bossbot_state.json
 data/trades.db
 data/*.db-wal
 data/*.db-shm
@@ -23,6 +25,10 @@ data/brain_state.json
 data/heartbeat.json
 data/instruments_cache.json
 data/dashboard.html
+
+# VPS-Daten-Backups (manuell gezogen, VPS = Source of Truth, nie ins Repo)
+Daten aus VPS/
+**/vpsbackup*.tar.gz
 data/threshold_sweep.txt
 data/regime_gate_test.txt
 data/walkforward.txt
