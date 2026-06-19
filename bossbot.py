@@ -43,10 +43,15 @@ BUDGET
   - Reicht das freie Kapital für einen Slot nicht → Signal verworfen, warten bis
     eine Position schließt. Max. NUM_STRATEGIES Positionen gleichzeitig.
 
-EXIT (Phase 1)
-  - Eigenes SL/TP (Abstände vom Vorbild-Bot) + Max-Hold-Timeout.
-  - Live: SL/TP liegen als echte Orders auf Kraken. (Exaktes Mit-Schließen,
-    wenn der Vorbild-Bot früher aussteigt → Phase 2.)
+EXIT
+  - Mirror-Close (BOSSBOT_MIRROR_CLOSE=1, default an): schließt der Vorbild-Bot
+    DIESEN Trade (erkannt an geänderter/fehlender Vorbild-Einstiegszeit), schließt
+    der BossBot mit (zum aktuellen Mark, Grund "source_closed"). Verhindert, dass
+    der BossBot länger hält als der Vorbild-Bot.
+  - Zusätzlich eigenes SL/TP (Abstände vom Vorbild-Bot) + Max-Hold-Timeout als
+    Sicherheitsnetz — was zuerst kommt.
+  - Live: SL/TP liegen als echte Orders auf Kraken; bei source_closed werden die
+    Rest-Orders gecancelt.
 """
 
 import asyncio
@@ -100,6 +105,7 @@ LEVERAGE          = _envf("BOSSBOT_LEVERAGE", 3.0)
 FEE_RATE          = _envf("BOSSBOT_FEE_RATE", 0.0005)        # 0,05 % je Seite
 MAX_HOLD_HOURS    = _envf("BOSSBOT_MAX_HOLD_HOURS", 48.0)
 FRESHNESS_SEC     = _envf("BOSSBOT_FRESHNESS_SEC", 90.0)     # nur frische Opens spiegeln
+MIRROR_CLOSE      = os.environ.get("BOSSBOT_MIRROR_CLOSE", "1").lower() not in ("0", "false", "no")
 MAX_DRAWDOWN_PCT  = _envf("BOSSBOT_MAX_DRAWDOWN_PCT", 0.30)  # Kill-Switch bei -30 % vom Start
 RANK_REFRESH_SEC  = _envf("BOSSBOT_RANK_REFRESH_SEC", 1800.0)  # alle 30 Min neu wählen
 LOOP_SEC          = _envf("BOSSBOT_LOOP_SEC", 10.0)
@@ -440,6 +446,9 @@ class BossBot:
             "margin": margin, "sl_price": sl_price, "tp_price": tp_price,
             "entry_fee": entry_fee, "opened_at": opened_at,
             "sl_order_id": sl_oid, "tp_order_id": tp_oid,
+            # Einstiegszeit des Vorbilds → erkennt, wenn der Vorbild-Bot DIESEN
+            # Trade schließt (Mirror-Close, sonst hielte der BossBot zu lange).
+            "source_entry_time": op.get("entry_time_utc"),
         }
         self.ledger.add_position(pos)
 
@@ -503,6 +512,20 @@ class BossBot:
             mark = self.market.mark(pos["symbol"])
             if mark <= 0:
                 continue
+
+            # Mirror-Close: hat der Vorbild-Bot DIESEN Trade geschlossen (oder schon
+            # einen neuen eröffnet)? Dann schließt der BossBot mit, statt ewig auf
+            # sein eigenes SL/TP zu warten. (Nur für Positionen MIT gespeicherter
+            # Vorbild-Einstiegszeit — Alt-Positionen vor diesem Feature bleiben bei
+            # SL/TP, um Fehl-Schließungen zu vermeiden.)
+            if MIRROR_CLOSE and "source_entry_time" in pos:
+                src = read_open_position(pos["source_bot_id"])
+                src_same = bool(src and src.get("symbol") == pos["symbol"]
+                                and src.get("entry_time_utc") == pos["source_entry_time"])
+                if not src_same:
+                    await self.close_position(pos, mark, "source_closed")
+                    continue
+
             side = pos["side"]
             sl = pos["sl_price"]
             tp = pos["tp_price"]
