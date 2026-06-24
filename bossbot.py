@@ -86,6 +86,16 @@ from network_db import get_connection
 import bossbot_db
 import bossbot_notifier as tg
 
+# Eigenhandel (2026-06-24): BossBot scort die besten Konfigs SELBST und filtert
+# mit Modell A + B – statt fremde Opens zu spiegeln. Wiederverwendung der echten
+# Bot-Pipeline (identische Signale wie die 50 Bots, nur sauber ausgeführt).
+from scoring_core import score_candles, passes_regime_gate
+from ml_network import ml_network
+from layers.layer1_macro import get_cached_direction
+from layers.layer2_regime import (
+    _klines_to_dataframe, _calculate_adx, ADX_TREND_THRESHOLD, ADX_PERIOD,
+)
+
 # ─── Konfiguration (aus Umgebung, mit Defaults) ──────────────────────────────
 
 def _envf(key, default):
@@ -125,6 +135,16 @@ MAX_PER_SYMBOL    = _envi("BOSSBOT_MAX_PER_SYMBOL", 0)         # 0 = unbegrenzt 
 # 0 = Filter aus (jeden Open spiegeln wie bisher). Fehlt p_win am Vorbild-Open
 # (alter Bot-State / A-Exploration ohne B-Score) → wird NICHT gespiegelt (fail-closed).
 B_THRESHOLD       = _envf("BOSSBOT_B_THRESHOLD", 0.50)
+
+# Handels-Modus (2026-06-24): "independent" = BossBot scort die Top-Konfigs selbst
+# (eigene Signale, eigenes Open/Close, kein Timing-Lag/Slippage vom Spiegeln);
+# "mirror" = altes Verhalten (fremde Opens spiegeln). Eigenhandel filtert mit A+B.
+TRADE_MODE        = os.environ.get("BOSSBOT_TRADE_MODE", "independent").lower()
+TRADE_CONFIGS_N   = _envi("BOSSBOT_TRADE_CONFIGS", 3)   # Top-N Konfigs für Eigenhandel
+# Scoring ist teuer (REST: Kerzen/Ticker/Funding je Konfig) → NICHT im 10s-Loop,
+# sondern getaktet (15min-Strategien brauchen kein Sekunden-Scoring). Positions-
+# Monitoring (SL/TP) bleibt im schnellen Loop.
+SCORE_INTERVAL_SEC = _envf("BOSSBOT_SCORE_INTERVAL_SEC", 300.0)
 
 # Einsatz/Margin je Strategie = Startkapital gleich auf NUM_STRATEGIES aufgeteilt
 # (z.B. 2500 / 25 = 100 € Margin je Position; mit LEVERAGE → Notional 100×Hebel).
@@ -251,6 +271,57 @@ def load_bot_meta() -> dict[int, tuple[str, str]]:
     return mapping
 
 
+def load_bot_full_config(bot_id: int) -> dict | None:
+    """Volle (flache) Bot-Config aus bots/bot{id}.json – für Eigenhandel-Scoring
+    (Strategie, Schwellen, ATR-Mults, macro_mode, adx_chop)."""
+    f = BOTS_DIR / f"bot{bot_id}.json"
+    if not f.exists():
+        return None
+    try:
+        return json.loads(f.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.debug(f"Bot-Config {bot_id} nicht lesbar: {e}")
+        return None
+
+
+def _regime_from_4h(klines_4h: list) -> str:
+    """4h-Regime (trending_up/down/ranging) aus 4h-Kerzen via ADX – eigenständig,
+    ohne den globalen state zu mutieren (anders als calculate_layer2_regime)."""
+    try:
+        if len(klines_4h) < ADX_PERIOD + 5:
+            return "ranging"
+        df = _klines_to_dataframe(klines_4h)
+        adx, plus_di, minus_di = _calculate_adx(df, ADX_PERIOD)
+        if len(adx) == 0:
+            return "ranging"
+        a = float(adx.iloc[-1])
+        if a > ADX_TREND_THRESHOLD:
+            return ("trending_up" if float(plus_di.iloc[-1]) > float(minus_di.iloc[-1])
+                    else "trending_down")
+        return "ranging"
+    except Exception:
+        return "ranging"
+
+
+def _macro_effective(base: str, mode: str) -> str:
+    """Makro-Richtung nach macro_mode transformiert (wie main._get_macro_direction)."""
+    if mode == "both":
+        return "both"
+    if mode == "invert":
+        return {"long": "short", "short": "long", "both": "both"}.get(base, "both")
+    return base  # "filter"
+
+
+def _macro_ok(order_side: str, base: str, mode: str) -> bool:
+    """Makro-Gate (wie risk_gate Check #5). base="both" (kein Makro-Cache im
+    BossBot-Prozess) → permissiv; greift erst, wenn ein Makro-Cache vorliegt."""
+    eff = _macro_effective(base, mode)
+    if eff == "both":
+        return True
+    return ((order_side == "BUY" and eff == "long")
+            or (order_side == "SELL" and eff == "short"))
+
+
 def select_top_bots(bot_meta: dict[int, tuple[str, str]]) -> dict[int, dict]:
     """
     Wählt die besten NUM_STRATEGIES (Default 25) der 50 Bots nach **realisiertem
@@ -374,12 +445,20 @@ class BossBot:
         # bot_id → {symbol, strategy, win_rate, total}  (die Top-N Bots)
         self.follow: dict[int, dict] = {}
         self._mirrored_keys: set[str] = set()  # (bot_id|entry_time) bereits gespiegelt
+        self._scored_keys: set[str] = set()    # (bot_id|candle_ts) bereits selbst gehandelt
         self._last_rank_ts = 0.0
+        self._last_score_ts = 0.0
 
     # ── Ranking ──────────────────────────────────────────────────────────────
 
     def refresh_ranking(self):
         self.follow = select_top_bots(self.bot_meta)
+        # Eigenhandel: nur die Top-N Konfigs handeln (Kapital konzentrieren).
+        if TRADE_MODE == "independent" and self.follow:
+            top_ids = sorted(self.follow.values(),
+                             key=lambda d: (d["net_pnl"], d["total"]),
+                             reverse=True)[:TRADE_CONFIGS_N]
+            self.follow = {d["bot_id"]: d for d in top_ids}
         if self.follow:
             top = sorted(self.follow.values(),
                          key=lambda d: (d["net_pnl"], d["total"]), reverse=True)
@@ -551,8 +630,9 @@ class BossBot:
 
             # Mirror-Close: hat der Vorbild-Bot DIESEN Trade geschlossen (oder schon
             # einen neuen eröffnet)? Dann schließt der BossBot mit, statt ewig auf
-            # sein eigenes SL/TP zu warten.
-            if MIRROR_CLOSE:
+            # sein eigenes SL/TP zu warten. NUR für gespiegelte Positionen – eigene
+            # (Eigenhandel) haben kein Vorbild und schließen über SL/TP/Timeout.
+            if MIRROR_CLOSE and not pos.get("independent"):
                 src = read_open_position(pos["source_bot_id"])
                 src_et = (src.get("entry_time_utc")
                           if src and src.get("symbol") == pos["symbol"] else None)
@@ -593,6 +673,163 @@ class BossBot:
                 await self.close_position(pos, hit[0], hit[1])
 
     # ── Mirroring ──────────────────────────────────────────────────────────────
+
+    # ── Eigenhandel: selbst scoren + Modell A/B-Filter (statt spiegeln) ──────────
+
+    async def score_and_trade(self):
+        """Scort die Top-N Konfigs SELBST, filtert mit Modell A + B und öffnet
+        eigene Positionen (kein Spiegeln). Öffnet so lange neue Trades, wie das
+        freie Kapital reicht (compute_qty gibt 0 zurück, sobald es nicht mehr reicht)."""
+        if self.ledger.halted:
+            return
+        for bot_id in list(self.follow):
+            if len(self.ledger.positions) >= MAX_POSITIONS:
+                break
+            cfg = load_bot_full_config(bot_id)
+            if not cfg or not cfg.get("symbol"):
+                continue
+            try:
+                await self._score_one(bot_id, cfg)
+            except Exception as e:
+                logger.error(f"Eigenhandel-Scoring Bot {bot_id} Fehler: {e}", exc_info=True)
+
+    async def _score_one(self, bot_id: int, cfg: dict):
+        symbol   = cfg["symbol"]
+        strategy = cfg.get("strategy", "momentum")
+
+        klines = await self.client.get_klines(symbol, "15m", 200)
+        if len(klines) < 50:
+            return
+        # Dedup: pro Konfig pro 15m-Kerze nur EIN Trade (sonst öffnet der 10s-Loop
+        # innerhalb derselben Kerze mehrfach dasselbe Signal).
+        candle_ts = klines[-1][0]
+        key = f"{bot_id}|{candle_ts}"
+        if key in self._scored_keys:
+            return
+
+        klines_4h = await self.client.get_klines(symbol, "4h", 100)
+        regime    = _regime_from_4h(klines_4h)
+
+        ticker  = await self.client.get_ticker(symbol)
+        mark    = self.market.mark(symbol) or float(klines[-1][4])
+        funding = await self.client.get_funding_rate(symbol)
+        oi      = float(ticker.get("openInterest", 0) or 0)
+        vwap    = float(ticker.get("vwap24h", 0) or 0)
+        hi      = float(ticker.get("high24h", mark) or mark)
+        lo      = float(ticker.get("low24h", mark) or mark)
+
+        result = score_candles(
+            symbol=symbol, klines=klines, funding_rate=funding, fg_index=50.0,
+            open_interest=oi, vwap24h=vwap, high24h=hi, low24h=lo,
+            strategy=strategy,
+            min_score_long=float(cfg.get("min_score_long", 5)),
+            min_score_short=float(cfg.get("min_score_short", -5)),
+            cached_regime=regime,
+            adx_chop_threshold=float(cfg.get("adx_chop_threshold", 18)),
+        )
+        if not result.signal or not result.direction:
+            return
+
+        # 4h-Regime-Gate (wie main.py)
+        if cfg.get("require_4h_regime_confirmation",
+                   config.require_4h_regime_confirmation) and \
+                not passes_regime_gate(result.direction, regime, strategy):
+            logger.info(f"{symbol}/{strategy}: 4h-Regime-Gate blockiert ({regime})")
+            return
+
+        # Stufe A – Candle-Modell (config-Politik contradict/confirm)
+        a_vetoed, a_reason, _ = ml_network.candle_veto(symbol, result)
+        if a_vetoed:
+            logger.info(f"{symbol}/{strategy}: Modell-A-Veto ({a_reason})")
+            return
+
+        # Stufe B – Win-Modell @ BossBot-Schwelle (exploit)
+        p_win = ml_network.predict_win_prob(symbol, result)
+        if p_win is None or p_win < B_THRESHOLD:
+            logger.info(f"{symbol}/{strategy}: Modell-B-Veto "
+                        f"(P(win)={p_win if p_win is None else f'{p_win:.3f}'} < {B_THRESHOLD})")
+            return
+
+        # Makro-Gate (best effort; "both" ohne Makro-Cache → permissiv)
+        order_side = "BUY" if result.direction == "long" else "SELL"
+        if not _macro_ok(order_side, get_cached_direction(), cfg.get("macro_mode", "both")):
+            logger.info(f"{symbol}/{strategy}: Makro-Gate blockiert ({order_side})")
+            return
+
+        self._scored_keys.add(key)
+        await self.open_from_signal(bot_id, cfg, result, mark, order_side, float(p_win))
+
+    async def open_from_signal(self, bot_id: int, cfg: dict, result, mark: float,
+                               side: str, p_win: float):
+        """Öffnet eine EIGENE Position aus einem selbst gescorten Signal."""
+        symbol = cfg["symbol"]
+        atr = result.atr or 0.0
+        if atr <= 0 or mark <= 0:
+            return
+        sl_mult = float(cfg.get("atr_sl_multiplier", 1.5))
+        tp_mult = float(cfg.get("atr_tp_multiplier", 3.0))
+        if side == "BUY":
+            sl_price = mark - atr * sl_mult
+            tp_price = mark + atr * tp_mult
+        else:
+            sl_price = mark + atr * sl_mult
+            tp_price = mark - atr * tp_mult
+
+        qty = self.compute_qty(symbol, mark)
+        if qty <= 0:
+            logger.info(f"{symbol}: nicht finanzierbar (frei {self.ledger.free_capital():.2f}) "
+                        f"– warte bis ein Slot frei wird.")
+            return
+
+        strat = cfg.get("strategy", "?")
+        notional = qty * mark
+        margin = notional / LEVERAGE
+        entry_fee = notional * FEE_RATE
+
+        sl_oid = tp_oid = None
+        if MODE == "live":
+            res = await self.client.place_market_order(symbol, side, qty)
+            if not res:
+                logger.error(f"{symbol}: Live-Entry fehlgeschlagen – kein Trade.")
+                return
+            close_side = "SELL" if side == "BUY" else "BUY"
+            sl_res = await self.client.place_stop_market(symbol, close_side, sl_price, close_position=True)
+            tp_res = await self.client.place_take_profit_market(symbol, close_side, tp_price, close_position=True)
+            sl_oid = (sl_res or {}).get("orderId")
+            tp_oid = (tp_res or {}).get("orderId")
+
+        opened_at = datetime.now(timezone.utc).isoformat()
+        db_id = bossbot_db.insert_open(
+            source_bot_id=bot_id, symbol=symbol, side=side, entry=mark,
+            qty=qty, leverage=LEVERAGE, margin=margin, sl_price=sl_price,
+            tp_price=tp_price, mode=MODE, opened_at=opened_at)
+
+        pos = {
+            "db_id": db_id, "source_bot_id": bot_id, "symbol": symbol,
+            "side": side, "entry": mark, "qty": qty, "leverage": LEVERAGE,
+            "margin": margin, "sl_price": sl_price, "tp_price": tp_price,
+            "entry_fee": entry_fee, "opened_at": opened_at,
+            "sl_order_id": sl_oid, "tp_order_id": tp_oid,
+            # Eigenhandel: kein Vorbild-Trade → KEIN Mirror-Close (eigenes SL/TP zählt).
+            "source_entry_time": None,
+            "independent": True,
+            "p_win": p_win,
+        }
+        self.ledger.add_position(pos)
+
+        logger.info(f"GEÖFFNET (eigen) {symbol} {side} qty={qty} @ {mark:.4f} "
+                    f"SL {sl_price:.4f} TP {tp_price:.4f} [{strat}, P(win)={p_win:.3f}, "
+                    f"Margin {margin:.2f}, frei {self.ledger.free_capital():.2f}]")
+        emoji = "🟢" if side == "BUY" else "🔴"
+        tg.send(
+            f"📈 <b>BossBot ÖFFNET</b> {emoji} [{MODE.upper()}]\n"
+            f"{symbol} <b>{side}</b> @ {mark:.4f}\n"
+            f"Menge: {qty} | Hebel: {LEVERAGE:.0f}x | Margin: {margin:.2f}\n"
+            f"SL: {sl_price:.4f} | TP: {tp_price:.4f}\n"
+            f"Strategie: {strat} (eigen) | P(win): {p_win:.0%}\n"
+            f"Freies Kapital: {self.ledger.free_capital():.2f} / {self.ledger.capital:.2f} "
+            f"({len(self.ledger.positions)}/{MAX_POSITIONS} Slots)\n"
+            f"<i>{tg.ts()}</i>")
 
     async def mirror_new_opens(self):
         if self.ledger.halted:
@@ -645,19 +882,28 @@ class BossBot:
                     self._last_rank_ts = now
 
                 await self.market.refresh()
-                await self.monitor_positions()   # erst schließen → Kapital frei
-                await self.mirror_new_opens()    # dann ggf. neu öffnen
+                await self.monitor_positions()   # erst schließen → Kapital frei (jeder Loop)
+                if TRADE_MODE == "independent":
+                    # Scoring getaktet (nicht jeden 10s-Loop) → schont REST/Rate-Limit
+                    if now - self._last_score_ts >= SCORE_INTERVAL_SEC:
+                        await self.score_and_trade()
+                        self._last_score_ts = now
+                else:
+                    await self.mirror_new_opens()# alt: fremde Opens spiegeln
             except Exception as e:
                 logger.error(f"Loop-Fehler: {e}", exc_info=True)
             await asyncio.sleep(LOOP_SEC)
 
     def _send_start_telegram(self):
+        modus = ("Eigenhandel (selbst scoren, Modell A+B-Filter @"
+                 f"{B_THRESHOLD:.2f}, Top-{TRADE_CONFIGS_N})"
+                 if TRADE_MODE == "independent" else "Spiegeln")
         tg.send(
             f"🤖 <b>BossBot gestartet</b> [{MODE.upper()}]\n"
+            f"Modus: {modus}\n"
             f"Kapital: {self.ledger.capital:.2f} (Start {self.ledger.start_capital:.0f})\n"
-            f"Top-{NUM_STRATEGIES} Bots gewählt | Einsatz {PER_STRATEGY_BUDGET:.0f} €/Strategie | "
-            f"Hebel: {LEVERAGE:.0f}x\n"
-            f"Aktuell gewählt: {len(self.follow)} Bots | offen: {len(self.ledger.positions)}\n"
+            f"Einsatz {PER_STRATEGY_BUDGET:.0f} €/Position | Hebel: {LEVERAGE:.0f}x\n"
+            f"Aktuell gewählt: {len(self.follow)} Konfigs | offen: {len(self.ledger.positions)}\n"
             f"Refresh alle {RANK_REFRESH_SEC/60:.0f} Min\n"
             f"<i>{tg.ts()}</i>")
 
