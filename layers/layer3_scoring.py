@@ -128,6 +128,10 @@ def _apply_ml_veto(result: ScoringResult, symbol: str) -> ScoringResult:
 
         # Stufe 2: Win-Modell (Modell B)
         prob = ml_network.predict_win_prob(symbol, result)
+        # P(win) am Signal merken → wird in open_position persistiert, damit der
+        # BossBot beim Mirroring auf eine höhere Schwelle filtern kann (exploit).
+        if prob is not None:
+            result.details["_p_win"] = float(prob)
         threshold = config.ml.get("veto_threshold", 0.42)
         if prob is not None and prob < threshold:
             # A1 — Exploration: knapp-vetoete High-Score-Signale gelegentlich

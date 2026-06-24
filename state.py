@@ -36,6 +36,7 @@ DEFAULT_STATE = {
         "atr_at_entry": None,
         "regime_at_entry": None,
         "liquidation_price": None,
+        "p_win": None,
     },
     "daily": {
         "date_utc": None,
@@ -82,6 +83,9 @@ class PositionState:
         self.atr_at_entry: Optional[float] = data.get("atr_at_entry")
         self.regime_at_entry: Optional[str] = data.get("regime_at_entry")
         self.liquidation_price: Optional[float] = data.get("liquidation_price")
+        # Modell-B P(win) beim Öffnen — persistiert, damit der BossBot beim Mirroring
+        # auf eine höhere Schwelle filtern kann (exploit) als die 50 Bots (explore).
+        self.p_win: Optional[float] = data.get("p_win")
         # S5-4/S5-5-Fix: Laufzeit-Referenzen für Outcome-Logging (nicht persistiert).
         self._db_trade_id: int = -1
         self._score: int = 0
@@ -102,6 +106,7 @@ class PositionState:
             "atr_at_entry": self.atr_at_entry,
             "regime_at_entry": self.regime_at_entry,
             "liquidation_price": self.liquidation_price,
+            "p_win": self.p_win,
         }
 
     def reset(self):
@@ -381,7 +386,8 @@ class BotState:
 
     def set_position(self, symbol: str, side: str, entry_price: float, qty: float,
                      sl_price: float, tp_price: float, entry_order_id: str,
-                     atr_at_entry: float, regime_at_entry: str):
+                     atr_at_entry: float, regime_at_entry: str,
+                     p_win: Optional[float] = None):
         """Setzt eine neue offene Position."""
         self.open_position.symbol = symbol
         self.open_position.side = side
@@ -393,6 +399,7 @@ class BotState:
         self.open_position.entry_time_utc = datetime.now(timezone.utc).isoformat()
         self.open_position.atr_at_entry = atr_at_entry
         self.open_position.regime_at_entry = regime_at_entry
+        self.open_position.p_win = p_win
         self.write_on_event("order_filled")
 
     def close_position(self):

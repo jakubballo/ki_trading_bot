@@ -118,6 +118,14 @@ RANK_WINDOW_HOURS = _envf("BOSSBOT_RANK_WINDOW_HOURS", 48.0)   # rollendes Bewer
 ONLY_PROFITABLE   = os.environ.get("BOSSBOT_ONLY_PROFITABLE", "1").lower() not in ("0", "false", "no")
 MAX_PER_SYMBOL    = _envi("BOSSBOT_MAX_PER_SYMBOL", 0)         # 0 = unbegrenzt (mehrere Pos. je Coin)
 
+# Modell-B-Filter (2026-06-24): BossBot ist die EXPLOIT-Schicht. Die 50 Bots handeln
+# bei veto_threshold=0.42 (explore, sammeln Labels über die ganze P-Verteilung); der
+# BossBot spiegelt NUR Trades, deren Modell-B P(win) >= dieser Schwelle liegt.
+# OOS-Holdout 2026-06-24 (AUC 0,62): @0.50 dreht die Testwoche −551→+333 USD.
+# 0 = Filter aus (jeden Open spiegeln wie bisher). Fehlt p_win am Vorbild-Open
+# (alter Bot-State / A-Exploration ohne B-Score) → wird NICHT gespiegelt (fail-closed).
+B_THRESHOLD       = _envf("BOSSBOT_B_THRESHOLD", 0.50)
+
 # Einsatz/Margin je Strategie = Startkapital gleich auf NUM_STRATEGIES aufgeteilt
 # (z.B. 2500 / 25 = 100 € Margin je Position; mit LEVERAGE → Notional 100×Hebel).
 PER_STRATEGY_BUDGET = START_CAPITAL / max(NUM_STRATEGIES, 1)
@@ -605,6 +613,15 @@ class BossBot:
                 continue
             if _age_seconds(op.get("entry_time_utc")) > FRESHNESS_SEC:
                 continue  # zu alt – verpasst / Carry-over
+            # Modell-B-Filter (exploit): nur spiegeln, wenn das Vorbild-Signal eine
+            # ausreichend hohe Win-Wahrscheinlichkeit hatte. Fehlt p_win → fail-closed.
+            if B_THRESHOLD > 0:
+                p_win = op.get("p_win")
+                if p_win is None or float(p_win) < B_THRESHOLD:
+                    self._mirrored_keys.add(key)  # nicht erneut prüfen, gilt als erledigt
+                    logger.info(f"Bot {bot_id} {op['symbol']} übersprungen "
+                                f"(P(win)={p_win} < {B_THRESHOLD})")
+                    continue
             if MAX_PER_SYMBOL > 0 and self.ledger.count_symbol(op["symbol"]) >= MAX_PER_SYMBOL:
                 continue  # optionales Pro-Coin-Limit erreicht
             self._mirrored_keys.add(key)

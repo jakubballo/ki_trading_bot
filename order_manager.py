@@ -213,6 +213,15 @@ async def on_fill_event_internal(fill_data: dict, sl_price: float, tp_price: flo
     logger.info(f"Fill bestätigt: {side} {qty} {symbol} @ {entry_price:.4f}")
 
     # State aktualisieren
+    # P(win) von Modell B (in layer3 berechnet, in details abgelegt) am State
+    # persistieren → BossBot kann beim Mirroring auf höhere Schwelle filtern.
+    _p_win = None
+    if details and details.get("_p_win") is not None:
+        try:
+            _p_win = float(details["_p_win"])
+        except (TypeError, ValueError):
+            _p_win = None
+
     state.set_position(
         symbol=symbol,
         side=side,
@@ -223,6 +232,7 @@ async def on_fill_event_internal(fill_data: dict, sl_price: float, tp_price: flo
         entry_order_id=order_id,
         atr_at_entry=atr,
         regime_at_entry=regime,
+        p_win=_p_win,
     )
 
     # Trade in DB loggen
