@@ -135,6 +135,23 @@ MAX_PER_SYMBOL    = _envi("BOSSBOT_MAX_PER_SYMBOL", 0)         # 0 = unbegrenzt 
 # 0 = Filter aus (jeden Open spiegeln wie bisher). Fehlt p_win am Vorbild-Open
 # (alter Bot-State / A-Exploration ohne B-Score) → wird NICHT gespiegelt (fail-closed).
 B_THRESHOLD       = _envf("BOSSBOT_B_THRESHOLD", 0.50)
+# B als BAND statt nur Untergrenze (2026-06-26, Punkt 3): Live-Auswertung der 128
+# Eigenhandel-Trades zeigte Modell B INVERS kalibriert — der Bucket p_win>=0.70 ist
+# der SCHLECHTESTE (WR 27,8 %, negativer PnL), nicht der beste. Daher Obergrenze:
+# nur handeln wenn B_THRESHOLD <= p_win < B_UPPER. 0 = keine Obergrenze (alt).
+B_UPPER           = _envf("BOSSBOT_B_UPPER", 0.70)
+
+# Pro-Coin-Preis-Dedup (2026-06-26, Punkt 2): kein zweiter Trade GLEICHER Richtung auf
+# demselben Coin, wenn schon eine offene Position innerhalb DEDUP_ATR_MULT × ATR vom
+# geplanten Einstieg liegt. Verhindert das Stapeln mehrerer Shorts am quasi gleichen
+# Preis (Verlust-Cluster). 0 = aus.
+DEDUP_ATR_MULT    = _envf("BOSSBOT_DEDUP_ATR_MULT", 1.0)
+
+# Momentum-Schutz (2026-06-26, Punkt 4): contrarian shortet in einen laufenden Grind-up
+# und wird reihenweise ausgestoppt (Kern-Verlustursache 26.06.). Blockiert einen Trade,
+# wenn der jüngste 1h-Return (_ret_4) noch DEUTLICH GEGEN die Trade-Richtung läuft:
+# SELL bei ret_4 > +Schwelle (Preis steigt noch), BUY bei ret_4 < −Schwelle. 0 = aus.
+MOMENTUM_GUARD_RET4 = _envf("BOSSBOT_MOMENTUM_GUARD_RET4", 0.003)
 
 # Handels-Modus (2026-06-24): "independent" = BossBot scort die Top-Konfigs selbst
 # (eigene Signale, eigenes Open/Close, kein Timing-Lag/Slippage vom Spiegeln);
@@ -697,6 +714,12 @@ class BossBot:
         symbol   = cfg["symbol"]
         strategy = cfg.get("strategy", "momentum")
 
+        # Punkt 1 (2026-06-26): Pro-Coin-Limit JETZT auch im Eigenhandel (vorher nur im
+        # Spiegel-Pfad → MAX_PER_SYMBOL war im Live-Modus ein No-Op, 19 LINK-Shorts
+        # gleichzeitig am 26.06.). Früh prüfen spart die teuren REST-Scoring-Calls.
+        if MAX_PER_SYMBOL > 0 and self.ledger.count_symbol(symbol) >= MAX_PER_SYMBOL:
+            return
+
         klines = await self.client.get_klines(symbol, "15m", 200)
         if len(klines) < 50:
             return
@@ -743,12 +766,27 @@ class BossBot:
             logger.info(f"{symbol}/{strategy}: Modell-A-Veto ({a_reason})")
             return
 
-        # Stufe B – Win-Modell @ BossBot-Schwelle (exploit)
+        # Stufe B – Win-Modell als BAND @ BossBot-Schwelle (exploit). Punkt 3 (2026-06-26):
+        # untere UND obere Grenze, weil B oben invers kalibriert ist (p_win>=0.70 = schlecht).
         p_win = ml_network.predict_win_prob(symbol, result)
         if p_win is None or p_win < B_THRESHOLD:
             logger.info(f"{symbol}/{strategy}: Modell-B-Veto "
                         f"(P(win)={p_win if p_win is None else f'{p_win:.3f}'} < {B_THRESHOLD})")
             return
+        if B_UPPER > 0 and p_win >= B_UPPER:
+            logger.info(f"{symbol}/{strategy}: Modell-B-Veto oben "
+                        f"(P(win)={p_win:.3f} >= {B_UPPER}, toxischer Bucket)")
+            return
+
+        # Punkt 4 (2026-06-26): Momentum-Schutz – nicht gegen einen frischen, laufenden
+        # 1h-Move handeln (contrarian-Shorts in den Grind-up = Kern-Verlustursache 26.06.).
+        if MOMENTUM_GUARD_RET4 > 0:
+            ret4 = float(result.details.get("_ret_4", 0.0))
+            if ((result.direction == "short" and ret4 > MOMENTUM_GUARD_RET4) or
+                    (result.direction == "long" and ret4 < -MOMENTUM_GUARD_RET4)):
+                logger.info(f"{symbol}/{strategy}: Momentum-Guard blockiert "
+                            f"({result.direction}, ret_4={ret4:+.4f})")
+                return
 
         # Makro-Gate (best effort; "both" ohne Makro-Cache → permissiv)
         order_side = "BUY" if result.direction == "long" else "SELL"
@@ -766,6 +804,17 @@ class BossBot:
         atr = result.atr or 0.0
         if atr <= 0 or mark <= 0:
             return
+        # Punkt 2 (2026-06-26): Preis-Nähe-Dedup. Kein zweiter gleichgerichteter Trade auf
+        # demselben Coin, wenn schon eine offene Position innerhalb DEDUP_ATR_MULT×ATR liegt
+        # (verhindert das Stapeln mehrerer Shorts am quasi gleichen Preis → Verlust-Cluster).
+        if DEDUP_ATR_MULT > 0:
+            for p in self.ledger.positions:
+                if (p["symbol"] == symbol and p["side"] == side
+                        and abs(mark - p["entry"]) < DEDUP_ATR_MULT * atr):
+                    logger.info(f"{symbol}: Dedup – offener {side} @ {p['entry']:.4f} "
+                                f"< {DEDUP_ATR_MULT}×ATR vom Einstieg {mark:.4f}, übersprungen.")
+                    return
+
         sl_mult = float(cfg.get("atr_sl_multiplier", 1.5))
         tp_mult = float(cfg.get("atr_tp_multiplier", 3.0))
         if side == "BUY":
